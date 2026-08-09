@@ -11,6 +11,10 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+
+from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
+from isaaclab.terrains.height_field import HfDiscreteObstaclesTerrainCfg
+
 from isaaclab.utils import configclass
 
 from . import mdp
@@ -19,7 +23,7 @@ from . import mdp
 # Pre-defined configs
 ##
 
-from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
+from assets.quadcopter import DRONE_CFG
 
 
 ##
@@ -33,12 +37,44 @@ class NavSceneCfg(InteractiveSceneCfg):
 
     # ground plane
     ground = AssetBaseCfg(
+        prim_path="/World/defaultGroundPlane",
+        spawn=sim_utils.GroundPlaneCfg(size=(300.0, 300.0)),
+    )
+
+    terrain = TerrainImporterCfg(
         prim_path="/World/ground",
-        spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0)),
+        terrain_type="generator",
+        terrain_generator=TerrainGeneratorCfg(
+            seed=0,
+            size=(40.0, 40.0),
+            border_width=5.0,
+            num_rows=1,
+            num_cols=1,
+            horizontal_scale=0.1,
+            vertical_scale=0.1,
+            slope_threshold=0.75,
+            use_cache=False,
+            color_scheme="height",
+            sub_terrains={
+                "obstacles": HfDiscreteObstaclesTerrainCfg(
+                    horizontal_scale=0.1,
+                    vertical_scale=0.1,
+                    border_width=0.0,
+                    num_obstacles=30,
+                    obstacle_height_mode="fixed",
+                    obstacle_width_range=(0.4, 1.1),
+                    obstacle_height_range=(6.0, 6.0),
+                    platform_width=0.0,
+                ),
+            },
+        ),
+        visual_material=None,
+        collision_group=-1,
+        debug_vis=True,
     )
 
     # robot
-    robot: ArticulationCfg = CARTPOLE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = DRONE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # lights
     dome_light = AssetBaseCfg(

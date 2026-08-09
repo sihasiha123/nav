@@ -9,30 +9,32 @@
 
 ## 首个可训练任务
 
-构建一个基于 Manager 的三维点到点导航任务：无人机从随机初始状态出发，在有限高度范围内飞到随机目标点；后续逐步加入静态障碍物和距离观测。
+构建一个基于 Manager 的三维点到点导航任务：多个无人机在同一张全局地图中并行训练，从地图边界随机起飞，穿过中心障碍区域飞向对侧目标点。场景组织方式参考 `/home/robot/RL/uav` 当前 `ppo-improvement` 分支：机器人按 env 并行管理，但静态地形、动态障碍物和大平地作为全局共享资源存在。
 
 固定的接口约定：
 
 - 策略动作：3 维归一化速度指令，映射为世界系 `[vx, vy, vz]`。
 - 低层控制：复用 `VelocityController`，由 ActionTerm 在每个 physics step 写入机身推力和力矩。
-- 目标：由 CommandManager 为每个环境独立采样三维目标位置。
-- 第一个训练版本不使用相机。避障使用接触传感器和轻量级 RayCaster，保证并行训练吞吐量。
+- 目标：由 CommandManager 为每个无人机独立采样起点和对侧目标点，但目标坐标位于同一个全局地图坐标系。
+- 第一个训练版本不使用相机。避障使用 RayCaster 和必要的碰撞/距离逻辑，保证并行训练吞吐量。
 
 ## 场景规格
 
-### 开阔空间版本
+### 共享全局地图版本
 
-- 每个环境是 12 m x 12 m x 5 m 的飞行区域，`env_spacing` 至少 16 m。
-- 地面位于 `z = 0`，无人机默认初始位置为 `(0, 0, 2)`。
-- 目标采样范围为 `x/y in [-4, 4]`、`z in [1.5, 3.0]`；目标与初始位置保持最小水平距离。
-- 用可视化 marker 显示目标，仅用于调试，不进入 policy 图像观测。
-- 四周设置可碰撞的边界墙，地面、墙体、越高/越低均可触发失败条件。
+- 多个无人机并行训练，但共享同一张 `/World/ground` 静态地形，不为每个 env 克隆一份障碍地图。
+- `scene.env_spacing = 0.0`，`replicate_physics = False`，无人机 prim 仍使用 `/World/envs/env_.*/Robot` 或 `{ENV_REGEX_NS}/Robot`，让 Isaac Lab 管理每个无人机的张量状态。
+- 大平地使用 `/World/defaultGroundPlane`，尺寸约 `100 m x 100 m` 或更大，用作背景和兜底地面。
+- 中心障碍地形使用 `/World/ground`，地图范围参考旧项目：`map_range = [20.0, 20.0, 6.0]`，即主要障碍区域约 `40 m x 40 m x 6 m`。
+- 静态障碍物优先迁移当前 `uav` 分支的 `StaticTerrainCfg`：高度场随机矩形障碍，默认 `num_static = 200`，尺寸范围 `(0.4, 1.1)`，高度范围 `(1.0, 6.0)`。
+- 训练起点从四条地图边界随机采样，`x/y = +/- map_range`，目标点放在对侧边界；初始高度采样 `z in [0.5, 2.5]`。
+- LiDAR 安装在 `/World/envs/env_.*/Robot/body`，只扫描 `mesh_prim_paths=["/World/ground"]`，观测 shape 保持 `[1, 36, 4]`，量程 `4 m`。
 
-### 避障版本
+### 开发降级版本
 
-- 在飞行区域内生成 2 至 6 个静态 Cuboid 障碍物，障碍物与起点、目标保持安全间隔。
-- 在机身上配置水平 RayCaster，初始使用 16 条等角射线和有限最大量程；接触传感器作为碰撞终止的最终依据。
-- 障碍物数量、尺寸、目标距离和初始速度均可由 CurriculumManager 渐进增加。
+- 第一轮场景测试可以先启用大 ground 和空 terrain，或将 `num_static` 降到 `30`，确认 spawn、reset、LiDAR 和控制器稳定。
+- 动态障碍物第一阶段可以关闭；静态地图和多无人机共享逻辑稳定后，再接入动态障碍物集合。
+- 目标 marker 仅用于 GUI 调试，不进入 policy 图像观测。
 
 ## 目录与职责
 
@@ -40,19 +42,21 @@
 
 ```text
 source/nav/nav/tasks/manager_based/nav/
-  scene_cfg.py                 # NavSceneCfg、地面、墙、障碍物、传感器、目标 marker
+  terrain.py                   # StaticTerrainCfg，迁移/整理当前 uav 分支的高度场障碍生成器
+  scene_cfg.py                 # NavSceneCfg、大 ground、共享 terrain、全局动态障碍物、传感器、目标 marker
   nav_env_cfg.py               # 汇总所有 Manager 配置和仿真参数
   mdp/
     actions.py                 # UavVelocityAction(ActionTerm)
     actions_cfg.py             # UavVelocityActionCfg(ActionTermCfg)
-    commands.py                # 随机目标点命令和目标 marker 更新
-    observations.py            # 无人机状态、相对目标、距离射线、上一动作
-    events.py                  # 根状态、目标、障碍物重置与随机化
+    commands.py                # 边界起点、对侧目标、目标 marker 更新
+    observations.py            # state、lidar、direction、dynamic_obstacle
+    events.py                  # 根状态 reset、目标 reset、共享动态障碍物 reset
     rewards.py                 # 导航与避障奖励
     terminations.py            # 到达、碰撞、越界、姿态和超时终止
+    dynamic.py                 # 共享动态障碍物运动逻辑，迁移当前 uav 分支 DynamicObstacles
 scripts/
   test_drone_dynamics.py       # 已完成：控制器和飞行动力学回归测试
-  test_nav_scene.py            # 新增：场景、传感器和多环境 reset 烟雾测试
+  test_nav_scene.py            # 新增：共享地图、传感器和多无人机 reset 烟雾测试
   test_uav_action.py           # 新增：ActionTerm 与控制器接线测试
 ```
 
@@ -61,20 +65,21 @@ scripts/
 ### 阶段 1：场景 MVP
 
 - [ ] 新建 `scene_cfg.py`，将 Cartpole 替换为 `DRONE_CFG`。
-- [ ] 创建地面、四面边界墙、灯光和目标 marker；暂不添加内部障碍物。
-- [ ] 设置开发配置为 `num_envs = 1`，确认 GUI 中的尺度、起飞高度、墙体碰撞和目标位置正确。
-- [ ] 新建 `scripts/test_nav_scene.py`，在无头模式测试 1 和 16 个环境的生成、reset、销毁与状态有限性。
+- [ ] 创建大 ground、灯光和空 `/World/ground` terrain；暂不添加动态障碍物。
+- [ ] 设置共享地图参数：`env_spacing = 0.0`、`replicate_physics = False`，确认多个无人机共享同一张地图而不是克隆地图。
+- [ ] 新建 `terrain.py`，迁移当前 `uav` 分支的 `StaticTerrainCfg`，先用 `num_static = 30` 做轻量测试。
+- [ ] 新建 `scripts/test_nav_scene.py`，在无头模式测试 1、16、128 个无人机的生成、reset、销毁与状态有限性。
 
-验收条件：无人机不穿透地面/墙体；每个 clone 内的无人机、墙体和目标互不串扰；16 环境 reset 后无 NaN 或 PhysX 报错。
+验收条件：多个无人机都位于同一张全局地图坐标系；`scene.env_origins` 不引入环境间地图偏移；reset 后无人机状态无 NaN 或 PhysX 报错；地形只生成一份 `/World/ground`。
 
 ### 阶段 2：传感器与障碍物
 
-- [ ] 为无人机配置 ContactSensor，用于地面、墙体和障碍物碰撞判定。
-- [ ] 为机身配置 RayCaster，确认射线相对机身姿态更新且读数有限。
-- [ ] 添加静态 Cuboid 障碍物生成器；先使用固定布局，再实现每环境随机布局。
-- [ ] 增加场景测试：目标与障碍物、起点的最小间距以及传感器张量形状。
+- [ ] 为机身配置 RayCaster，路径为 `/World/envs/env_.*/Robot/body`，扫描 `mesh_prim_paths=["/World/ground"]`。
+- [ ] 保持旧任务观测形状：`state=8`、`lidar=[1, 36, 4]`、`direction=[1, 3]`、`dynamic_obstacle=[1, 5, 10]`。
+- [ ] 将静态障碍数量从 `30` 提升到当前分支默认 `200`，再根据吞吐量评估是否恢复更密集配置。
+- [ ] 增加场景测试：LiDAR 能打到共享 terrain；不同无人机在同一障碍附近获得不同距离读数；起点/目标位于地图边界且方向正确。
 
-验收条件：碰撞可稳定检测；射线能区分自由空间与障碍物；所有生成的初始状态可飞行且目标可达。
+验收条件：RayCaster 读数有限；静态碰撞可由 LiDAR 最近距离稳定推断；所有生成的初始状态可飞行且目标可达。
 
 ### 阶段 3：接入 Manager Action
 
@@ -87,21 +92,22 @@ scripts/
 
 ### 阶段 4：自由空间目标导航
 
-- [ ] 实现目标位置 CommandTerm，并将相对目标位置加入 policy 观测。
-- [ ] 观测最小集：相对目标位置、世界/机体线速度、角速度、投影重力、上一动作。
-- [ ] 事件：随机根位置、姿态、线速度、目标点；保持安全高度和目标最小距离。
-- [ ] 奖励：目标距离进展、到达奖励、动作变化惩罚、过大角速度惩罚、失败惩罚。
-- [ ] 终止：到达目标、超时、越界、触地、过大倾角。
+- [ ] 实现边界起点和对侧目标 CommandTerm，复刻当前 `uav` 分支 reset 逻辑。
+- [ ] 观测最小集按旧任务保持：目标单位方向、xy 距离、z 距离、goal frame 速度、direction。
+- [ ] 事件：随机根位置、朝向目标的 yaw、零速度、目标点；保持安全高度和目标最小距离。
+- [ ] 奖励：目标距离进展、朝目标速度、静态障碍安全距离、动态障碍安全距离、高度、平滑、碰撞惩罚、到达奖励。
+- [ ] 终止策略需要二选一并固定：当前 `ppo-improvement` 分支是成功即 terminated；旧版文档曾采用到达目标后保持到 timeout。Manager 版先以当前分支为准，成功、碰撞、越界、超时均结束回合。
 - [ ] 将 Gym 注册名从模板 `Template-Nav-v0` 改为项目命名，例如 `Nav-Drone-PointNav-v0`。
 
-验收条件：`zero_agent`、随机动作和固定速度动作可以完整运行；策略可在无障碍场景中达到随机目标。
+验收条件：`zero_agent`、随机动作和固定速度动作可以完整运行；策略可在共享地图中完成边界到对侧目标的无障碍版本。
 
 ### 阶段 5：障碍物导航与课程学习
 
 - [ ] 将 RayCaster 距离和碰撞状态加入观测/终止逻辑。
 - [ ] 增加障碍物接近惩罚、碰撞强惩罚和安全到达奖励。
-- [ ] 课程从无障碍、近距离目标开始，逐步增加目标距离、障碍物数量、障碍物尺寸和初始速度。
-- [ ] 将开发环境数逐步扩展为 16、128，再根据 GPU 显存和步进吞吐量确定训练环境数。
+- [ ] 接入共享动态障碍物集合：参考当前 `uav` 分支 `RigidObjectCollectionCfg` 和 `DynamicObstacles`，默认 `dyn_num_obstacles = 40`。
+- [ ] 课程从空 terrain、少量静态障碍开始，逐步增加静态障碍数量、动态障碍数量、速度范围和目标难度。
+- [ ] 将开发无人机数逐步扩展为 16、128、1024，再根据 GPU 显存和步进吞吐量确定正式训练规模。
 
 验收条件：独立评测布局中统计成功率、碰撞率、平均到达时间和最小障碍距离；训练集之外的障碍布局不发生明显性能塌缩。
 
@@ -117,5 +123,6 @@ scripts/
 
 - 在阶段 1 至 3 全部通过前，不启动 PPO 长训练。
 - 每一阶段只新增一个可验证能力，并保留对应 headless 测试脚本。
+- 共享地图是本项目的场景假设：不要默认改成每个 env 独立克隆地形，除非后续实验明确需要。
 - 不为训练使用视觉输入，除非 RayCaster 方案无法满足避障信息需求。
 - 除非动力学回归测试失败，不修改已经验证过的 `VelocityController` 增益和执行流程。
