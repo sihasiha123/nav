@@ -250,3 +250,6 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
         # 仿真配置
         self.sim.dt = 1 / 60
         self.sim.render_interval = self.decimation
+        # 与 test_drone_dynamics.py 保持一致：每个物理迭代应用外力，
+        # 减小速度反馈噪声，避免悬停抖动。
+        self.sim.physx.enable_external_forces_every_iteration = True
