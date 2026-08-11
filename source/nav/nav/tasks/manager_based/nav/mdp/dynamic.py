@@ -7,23 +7,17 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 
 from isaaclab.assets import RigidObjectCollection
+from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.utils import configclass
-
-if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
-
 
 __all__ = [
     "GlobalObstacleManager",
     "GlobalObstacleMotionCfg",
     "get_global_obstacle_manager",
     "initialize_global_obstacles",
-    "reset_global_obstacles",
     "step_global_obstacles",
 ]
 
@@ -84,6 +78,7 @@ class GlobalObstacleManager:
         self._position_w: torch.Tensor
         self._target_pos_w: torch.Tensor
         self._linear_velocity_w: torch.Tensor
+        self._angular_velocity_w: torch.Tensor
         self._speed: torch.Tensor
         self._pose_w: torch.Tensor
 
@@ -101,6 +96,7 @@ class GlobalObstacleManager:
         self._position_w = self._pose_w[..., :3].clone()
         self._target_pos_w = self._anchor_pos_w.clone()
         self._linear_velocity_w = torch.zeros_like(self._position_w)
+        self._angular_velocity_w = torch.zeros_like(self._position_w)
         self._speed = torch.empty(
             (*self._position_w.shape[:-1], 1),
             dtype=self._position_w.dtype,
@@ -116,7 +112,7 @@ class GlobalObstacleManager:
         self._initialized = True
 
     def step(self, dt: float) -> None:
-        """推进一个物理步，并批量写入所有障碍物的位姿。"""
+        """推进一个物理步，并批量写入所有障碍物的位姿和速度。"""
         if dt <= 0.0:
             raise ValueError(f"Obstacle motion time-step must be positive, received: {dt}.")
         if not self._initialized:
@@ -139,18 +135,11 @@ class GlobalObstacleManager:
         self._linear_velocity_w.copy_(displacement / dt)
         self._pose_w[..., :3].copy_(self._position_w)
 
-        # 场景配置使用运动学刚体，因此直接按脚本写入位姿。线速度仅保存在管理器中
-        # 供观测使用，不通过只适用于非运动学刚体的 PhysX 速度接口写入。
+        # 场景配置使用运动学刚体，因此直接按脚本写入位姿和速度。角速度保持为零。
+        # 速度写入 PhysX 后，无人机与障碍物接触时碰撞响应能使用真实的相对速度。
+        link_velocity = torch.cat([self._linear_velocity_w, self._angular_velocity_w], dim=-1)
         self.asset.write_object_link_pose_to_sim(self._pose_w)
-
-    def reset_global(self) -> None:
-        """将全部障碍物恢复到配置的运动原点，并重新采样航点。"""
-        default_state = self.asset.data.default_object_state.clone()
-        self.asset.write_object_link_pose_to_sim(default_state[..., :7])
-        self.asset.reset()
-
-        self._initialized = False
-        self.initialize()
+        self.asset.write_object_link_velocity_to_sim(link_velocity)
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
@@ -235,8 +224,3 @@ def step_global_obstacles(
     """推进全局障碍物一次，应在物理仿真前调用。"""
     physics_dt = env.physics_dt if dt is None else dt
     get_global_obstacle_manager(env, cfg).step(physics_dt)
-
-
-def reset_global_obstacles(env: ManagerBasedRLEnv) -> None:
-    """显式重置全局集合，该操作与机器人的环境 ID 无关。"""
-    get_global_obstacle_manager(env).reset_global()

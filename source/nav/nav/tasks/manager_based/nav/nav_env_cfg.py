@@ -10,7 +10,6 @@ from isaaclab.assets import (
     RigidObjectCollectionCfg,
 )
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -29,7 +28,7 @@ from . import mdp
 # 预定义配置
 ##
 
-from nav.assets.quadcopter import DRONE_CFG
+from nav.assets.quadcopter import DRONE_NO_COLLIDER_CFG
 
 
 ##
@@ -38,17 +37,15 @@ from nav.assets.quadcopter import DRONE_CFG
 
 
 class GlobalRigidObjectCollection(RigidObjectCollection):
-    """不会随单个并行环境重置的全局刚体集合。
-
-    使用绝对 ``/World`` 路径生成的集合只有一个实例，而导航任务包含多个机器人
-    环境。Manager-based 环境重置时会把机器人的 ``env_ids`` 传给所有场景实体，
-    因此不能继续把这些索引传给全局单例集合。
-    """
+    """不会随并行环境重置的全局刚体集合。"""
 
     def reset(self, env_ids=None, object_ids=None) -> None:
-        """忽略单环境重置，仅响应显式的全局重置。"""
-        if env_ids is None:
-            super().reset(env_ids=None, object_ids=object_ids)
+        """忽略场景重置。"""
+        # 全局集合只有一个 instance，而 scene.reset() 传入的 env_ids 是 num_envs 维
+        # 机器人索引，与集合的 instance 维度不匹配，因此完全忽略场景重置。
+        # 障碍物每次训练都从新进程的 spawn 状态开始，由管理器懒初始化复位，
+        # 不依赖场景重置；父类 reset() 仅清 wrench 缓冲，本集合不使用 wrench。
+        pass
 
 
 def make_global_obstacle_collection_cfg(
@@ -152,7 +149,7 @@ class NavSceneCfg(InteractiveSceneCfg):
     )
 
     # 无人机
-    robot: ArticulationCfg = DRONE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = DRONE_NO_COLLIDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # 所有机器人环境共享同一套全局障碍物；接入运行时运动管理器前保持静止。
     dynamic_obstacles: RigidObjectCollectionCfg = make_global_obstacle_collection_cfg()
@@ -173,94 +170,51 @@ class NavSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """MDP 的动作项配置。"""
 
-    joint_effort = mdp.JointEffortActionCfg(asset_name="robot", joint_names=["slider_to_cart"], scale=100.0)
+    # 无人机三维世界系速度指令 [vx, vy, vz]（m/s）
+    uav_velocity = mdp.UavVelocityActionCfg(asset_name="robot")
+
+    # 全局动态障碍物运动项：不消耗动作维度，在每个物理步前推进障碍物。
+    global_obstacle_motion = mdp.GlobalObstacleMotionActionCfg()
 
 
 @configclass
 class ObservationsCfg:
-    """MDP 的观测项配置。"""
+    """MDP 的观测项配置（占位：仅用于调试）。"""
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """策略观测组。"""
+        """策略观测组（占位：无人机根位置和线速度）。"""
 
-        # 观测项（保持此处声明的顺序）
-        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+        root_pos = ObsTerm(func=mdp.root_pos_w, params={"asset_cfg": SceneEntityCfg("robot")})
+        root_lin_vel = ObsTerm(func=mdp.root_lin_vel_w, params={"asset_cfg": SceneEntityCfg("robot")})
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
             self.concatenate_terms = True
 
-    # 观测组
+    # 观测组（占位）
     policy: PolicyCfg = PolicyCfg()
 
 
 @configclass
 class EventCfg:
-    """事件项配置。"""
+    """事件项配置（占位：暂无事件项）。"""
 
-    # 重置事件
-    reset_cart_position = EventTerm(
-        func=mdp.reset_joints_by_offset,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]),
-            "position_range": (-1.0, 1.0),
-            "velocity_range": (-0.5, 0.5),
-        },
-    )
-
-    reset_pole_position = EventTerm(
-        func=mdp.reset_joints_by_offset,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]),
-            "position_range": (-0.25 * math.pi, 0.25 * math.pi),
-            "velocity_range": (-0.25 * math.pi, 0.25 * math.pi),
-        },
-    )
+    pass
 
 
 @configclass
 class RewardsCfg:
-    """MDP 的奖励项配置。"""
+    """MDP 的奖励项配置（占位：仅存活奖励）。"""
 
-    # （1）恒定存活奖励
     alive = RewTerm(func=mdp.is_alive, weight=1.0)
-    # （2）失败惩罚
-    terminating = RewTerm(func=mdp.is_terminated, weight=-2.0)
-    # （3）主要任务：保持杆直立
-    pole_pos = RewTerm(
-        func=mdp.joint_pos_target_l2,
-        weight=-1.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]), "target": 0.0},
-    )
-    # （4）塑形任务：降低小车速度
-    cart_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.01,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"])},
-    )
-    # （5）塑形任务：降低杆的角速度
-    pole_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.005,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"])},
-    )
 
 
 @configclass
 class TerminationsCfg:
-    """MDP 的终止项配置。"""
+    """MDP 的终止项配置（占位：仅超时）。"""
 
-    # （1）超时
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # （2）小车越界
-    cart_out_of_bounds = DoneTerm(
-        func=mdp.joint_pos_out_of_manual_limit,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-3.0, 3.0)},
-    )
 
 
 ##
@@ -289,10 +243,10 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self) -> None:
         """完成环境配置的后初始化。"""
         # 通用配置
-        self.decimation = 2
+        self.decimation = 1
         self.episode_length_s = 5
         # 查看器配置
         self.viewer.eye = (8.0, 0.0, 5.0)
         # 仿真配置
-        self.sim.dt = 1 / 120
+        self.sim.dt = 1 / 60
         self.sim.render_interval = self.decimation

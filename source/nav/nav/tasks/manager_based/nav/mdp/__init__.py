@@ -7,5 +7,7 @@
 
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 
+from .actions import *  # noqa: F401, F403
 from .dynamic import *  # noqa: F401, F403
+from .global_obstacle_action import *  # noqa: F401, F403
 from .rewards import *  # noqa: F401, F403
