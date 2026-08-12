@@ -1,21 +1,19 @@
 
-import math
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import (
     ArticulationCfg,
     AssetBaseCfg,
-    RigidObjectCfg,
-    RigidObjectCollection,
     RigidObjectCollectionCfg,
 )
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import RayCasterCfg, patterns
 
 from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.terrains.height_field import HfDiscreteObstaclesTerrainCfg
@@ -32,79 +30,6 @@ from nav.assets.quadcopter import DRONE_NO_COLLIDER_CFG
 
 
 ##
-# 场景定义
-##
-
-
-class GlobalRigidObjectCollection(RigidObjectCollection):
-    """不会随并行环境重置的全局刚体集合。"""
-
-    def reset(self, env_ids=None, object_ids=None) -> None:
-        """忽略场景重置。"""
-        # 全局集合只有一个 instance，而 scene.reset() 传入的 env_ids 是 num_envs 维
-        # 机器人索引，与集合的 instance 维度不匹配，因此完全忽略场景重置。
-        # 障碍物每次训练都从新进程的 spawn 状态开始，由管理器懒初始化复位，
-        # 不依赖场景重置；父类 reset() 仅清 wrench 缓冲，本集合不使用 wrench。
-        pass
-
-
-def make_global_obstacle_collection_cfg(
-    count: int = 100,
-    terrain_size: tuple[float, float] = (40.0, 40.0),
-    margin: float = 2.0,
-    obstacle_size: tuple[float, float, float] = (0.5, 0.5, 1.0),
-    obstacle_height: float = 1.5,
-) -> RigidObjectCollectionCfg:
-    """按照近似正方形网格创建一套全局障碍物集合。
-
-    配置中的初始位置同时作为运动原点，后续运行时管理器可以从
-    ``default_object_state`` 中读取这些位置。
-    """
-    if count <= 0:
-        raise ValueError(f"Obstacle count must be positive, received: {count}.")
-    if margin < 0.0:
-        raise ValueError(f"Obstacle margin must be non-negative, received: {margin}.")
-
-    terrain_width, terrain_length = terrain_size
-    usable_width = terrain_width - 2.0 * margin
-    usable_length = terrain_length - 2.0 * margin
-    if usable_width <= 0.0 or usable_length <= 0.0:
-        raise ValueError("Obstacle margin leaves no usable terrain area.")
-
-    num_cols = math.ceil(math.sqrt(count))
-    num_rows = math.ceil(count / num_cols)
-    cell_width = usable_width / num_cols
-    cell_length = usable_length / num_rows
-
-    obstacle_cfgs: dict[str, RigidObjectCfg] = {}
-    for obstacle_index in range(count):
-        row, col = divmod(obstacle_index, num_cols)
-        x = -0.5 * terrain_width + margin + (col + 0.5) * cell_width
-        y = -0.5 * terrain_length + margin + (row + 0.5) * cell_length
-
-        obstacle_name = f"obstacle_{obstacle_index:03d}"
-        obstacle_cfgs[obstacle_name] = RigidObjectCfg(
-            prim_path=f"/World/Dynamic/Obstacle_{obstacle_index:03d}",
-            spawn=sim_utils.CuboidCfg(
-                size=obstacle_size,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    kinematic_enabled=True,
-                    disable_gravity=True,
-                ),
-                mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-                collision_props=sim_utils.CollisionPropertiesCfg(),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.2, 0.15)),
-            ),
-            init_state=RigidObjectCfg.InitialStateCfg(pos=(x, y, obstacle_height)),
-            collision_group=-1,
-        )
-
-    return RigidObjectCollectionCfg(
-        class_type=GlobalRigidObjectCollection,
-        rigid_objects=obstacle_cfgs,
-    )
-
-
 @configclass
 class NavSceneCfg(InteractiveSceneCfg):
     """共享地图无人机导航场景配置。"""
@@ -151,8 +76,24 @@ class NavSceneCfg(InteractiveSceneCfg):
     # 无人机
     robot: ArticulationCfg = DRONE_NO_COLLIDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
+    # 激光雷达：扫描共享地形，量程 4m，36 水平 x 4 垂直光束
+    lidar: RayCasterCfg = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/body",
+        update_period=0.0,
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.LidarPatternCfg(
+            channels=4,
+            vertical_fov_range=(-10.0, 20.0),
+            horizontal_fov_range=(0.0, 360.0),
+            horizontal_res=10.0,
+        ),
+        debug_vis=False,
+        mesh_prim_paths=["/World/ground"],
+    )
+
     # 所有机器人环境共享同一套全局障碍物；接入运行时运动管理器前保持静止。
-    dynamic_obstacles: RigidObjectCollectionCfg = make_global_obstacle_collection_cfg()
+    dynamic_obstacles: RigidObjectCollectionCfg = mdp.make_global_obstacle_collection_cfg()
 
     # 灯光
     dome_light = AssetBaseCfg(
@@ -179,41 +120,57 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
-    """MDP 的观测项配置（占位：仅用于调试）。"""
+    """MDP 的观测项配置（导航版，全部转 goal frame）。"""
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """策略观测组（占位：无人机根位置和线速度）。"""
+        """策略观测组。"""
 
-        root_pos = ObsTerm(func=mdp.root_pos_w, params={"asset_cfg": SceneEntityCfg("robot")})
-        root_lin_vel = ObsTerm(func=mdp.root_lin_vel_w, params={"asset_cfg": SceneEntityCfg("robot")})
+        state = ObsTerm(func=mdp.state_obs, params={"asset_cfg": SceneEntityCfg("robot")})
+        lidar = ObsTerm(func=mdp.lidar_obs, params={"asset_cfg": SceneEntityCfg("lidar")})
+        direction = ObsTerm(func=mdp.direction_obs)
+        dynamic_obstacle = ObsTerm(func=mdp.dynamic_obstacle_obs)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
-            self.concatenate_terms = True
+            # 保持 dict 结构（state/lidar/direction/dynamic 分开），
+            # 便于后续网络分别编码（lidar 用 CNN，其余用 MLP）。
+            self.concatenate_terms = False
 
-    # 观测组（占位）
+    # 观测组
     policy: PolicyCfg = PolicyCfg()
 
 
 @configclass
 class EventCfg:
-    """事件项配置（占位：暂无事件项）。"""
+    """事件项配置。"""
 
-    pass
+    # 重置：从地图边界随机起点，目标放对侧，yaw 朝向目标
+    reset_nav_task = EventTerm(
+        func=mdp.reset_nav_task,
+        mode="reset",
+        params={
+            "map_range": (20.0, 20.0, 6.0),
+            "start_z_range": (0.5, 2.5),
+        },
+    )
 
 
 @configclass
 class RewardsCfg:
-    """MDP 的奖励项配置（占位：仅存活奖励）。"""
+    """MDP 的奖励项配置（uav 权重）。"""
 
-    alive = RewTerm(func=mdp.is_alive, weight=1.0)
+    navigation = RewTerm(func=mdp.navigation_reward, weight=1.0)
 
 
 @configclass
 class TerminationsCfg:
-    """MDP 的终止项配置（占位：仅超时）。"""
+    """MDP 的终止项配置。"""
 
+    static_collision = DoneTerm(func=mdp.static_collision, params={"asset_cfg": SceneEntityCfg("lidar")})
+    dynamic_collision = DoneTerm(func=mdp.dynamic_collision)
+    out_of_bounds = DoneTerm(func=mdp.out_of_bounds)
+    success = DoneTerm(func=mdp.success)
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
 
@@ -246,10 +203,10 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 1
         self.episode_length_s = 5
         # 查看器配置
-        self.viewer.eye = (8.0, 0.0, 5.0)
+        self.viewer.eye = (0.0, 0.0, 30.0)   # 相机在原点正上方 30m
         # 仿真配置
         self.sim.dt = 1 / 60
         self.sim.render_interval = self.decimation
-        # 与 test_drone_dynamics.py 保持一致：每个物理迭代应用外力，
+        # 每个物理迭代应用外力，
         # 减小速度反馈噪声，避免悬停抖动。
         self.sim.physx.enable_external_forces_every_iteration = True

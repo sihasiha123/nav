@@ -87,6 +87,37 @@ reward = 4.0 * progress
 - 特征提取：lidar CNN + dynamic obstacle MLP + state concat 融合。
 - Trainer 用 TensorDict 管理 rollout；环境只返回普通 dict。
 
+### 框架分层（Env / Trainer / 算法层）
+
+三个层次各自独立，只通过固定接口接触：
+
+| 层 | 负责 | 知道什么 | 不知道什么 |
+|---|---|---|---|
+| Env | 仿真：场景、物理、动作、观测、奖励、终止、重置 | 世界如何响应动作 | PPO、rollout、网络 |
+| Trainer | 数据与流程：收集 rollout、调度 act/update、日志、checkpoint | env 接口 + 算法接口 | 物理细节、网络内部 |
+| Algorithm | 学习：网络结构、GAE、PPO clip、梯度更新 | obs → action/value、如何更新参数 | 仿真、奖励公式 |
+
+三个接口：
+
+```text
+env.step(action)      # 世界走一步，返回 obs/reward/done
+agent.act(obs)        # 采样 action + log_prob + value
+agent.update(rollout) # 用一批数据更新网络
+```
+
+完整时间线：
+
+```text
+obs_t
+  → trainer: agent.act(obs_t)                  # 算法层推理
+  → trainer: env.step(action_t)                # 环境层仿真（含自动重置）
+  → trainer: 存一条 transition
+  → 重复 num_steps_per_env 次，得到 rollout
+  → trainer: agent.update(rollout)             # 算法层学习
+```
+
+对应本项目：Env = nav（NavEnvCfg + mdp），Trainer = uav 的 scripts/train.py（待移植），Algorithm = uav 的 agents/ppo.py（待移植）。
+
 ## 首个可训练任务
 
 构建一个基于 Manager 的三维点到点导航任务：多个无人机在同一张全局地图中并行训练，从地图边界随机起飞，穿过中心障碍区域飞向对侧目标点。场景组织参考 uav direct 版：机器人按 env 并行管理，静态地形、动态障碍物和大平地作为全局共享资源。
