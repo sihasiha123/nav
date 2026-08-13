@@ -19,6 +19,11 @@ from .observations import _lidar_distance, _obstacle_size
 __all__ = ["navigation_reward"]
 
 
+##
+# 导航奖励
+##
+
+
 def navigation_reward(
     env: ManagerBasedRLEnv,
     lidar_range: float = 4.0,

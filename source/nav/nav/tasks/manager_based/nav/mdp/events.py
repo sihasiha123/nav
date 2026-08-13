@@ -22,6 +22,11 @@ __all__ = [
 _TASK_BUFFER_ATTRIBUTE = "_nav_task_buffer"
 
 
+##
+# 任务状态缓冲
+##
+
+
 class NavTaskBuffer:
     """每个无人机 episode 的任务状态（目标、方向、历史量）。"""
 
@@ -43,6 +48,11 @@ def get_nav_task_buffer(env: ManagerBasedRLEnv) -> NavTaskBuffer:
         buffer = NavTaskBuffer(env)
         setattr(env, _TASK_BUFFER_ATTRIBUTE, buffer)
     return buffer
+
+
+##
+# 重置事件
+##
 
 
 def yaw_to_quat(yaw: torch.Tensor) -> torch.Tensor:

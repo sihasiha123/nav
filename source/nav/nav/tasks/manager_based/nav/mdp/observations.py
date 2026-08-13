@@ -24,6 +24,11 @@ __all__ = [
 ]
 
 
+##
+# 坐标工具
+##
+
+
 def vec_to_new_frame(vec: torch.Tensor, goal_direction: torch.Tensor) -> torch.Tensor:
     """把向量转到 goal frame（x 轴沿任务方向，z 轴保持世界垂直）。"""
     if vec.dim() == 1:
@@ -47,6 +52,11 @@ def vec_to_new_frame(vec: torch.Tensor, goal_direction: torch.Tensor) -> torch.T
         vec_z = torch.bmm(vec.view(n, 1, 3), goal_direction_z.view(n, 3, 1))
 
     return torch.cat((vec_x, vec_y, vec_z), dim=-1)
+
+
+##
+# 观测项
+##
 
 
 def _goal_frame_direction(env: ManagerBasedRLEnv) -> torch.Tensor:

@@ -24,6 +24,11 @@ __all__ = [
 ]
 
 
+##
+# 碰撞终止
+##
+
+
 def static_collision(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -56,6 +61,11 @@ def dynamic_collision(
     collision_2d = distance_2d <= obstacle_width.squeeze(-1) * 0.5 + margin
     collision_z = distance_z <= obstacle_height.squeeze(-1) * 0.5 + margin
     return (collision_2d & collision_z).any(dim=-1)
+
+
+##
+# 越界与成功
+##
 
 
 def out_of_bounds(

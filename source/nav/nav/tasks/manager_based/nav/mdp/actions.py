@@ -16,6 +16,11 @@ from isaaclab.utils import configclass
 from nav.controllers import VelocityController, VelocityControllerCfg
 
 
+##
+# 动作实现
+##
+
+
 class UavVelocityAction(ActionTerm):
     """将三维世界系速度指令映射到无人机控制器。
 
@@ -82,6 +87,11 @@ class UavVelocityAction(ActionTerm):
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
         self._controller.reset_idx(env_ids)
+
+
+##
+# 动作配置
+##
 
 
 @configclass

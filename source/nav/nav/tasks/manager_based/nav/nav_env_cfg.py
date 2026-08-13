@@ -69,7 +69,7 @@ class NavSceneCfg(InteractiveSceneCfg):
         ),
         visual_material=None,
         collision_group=-1,
-        debug_vis=True,
+        debug_vis=False,
         use_terrain_origins=False,
     )
 
