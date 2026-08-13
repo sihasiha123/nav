@@ -59,7 +59,7 @@ class NavSceneCfg(InteractiveSceneCfg):
                     horizontal_scale=0.1,
                     vertical_scale=0.1,
                     border_width=0.0,
-                    num_obstacles=30,
+                    num_obstacles=200,
                     obstacle_height_mode="fixed",
                     obstacle_width_range=(0.4, 1.1),
                     obstacle_height_range=(6.0, 6.0),
@@ -92,8 +92,8 @@ class NavSceneCfg(InteractiveSceneCfg):
         mesh_prim_paths=["/World/ground"],
     )
 
-    # 所有机器人环境共享同一套全局障碍物；接入运行时运动管理器前保持静止。
-    dynamic_obstacles: RigidObjectCollectionCfg = mdp.make_global_obstacle_collection_cfg()
+    # 所有机器人环境共享同一套全局障碍物；count=0 时返回 None（禁用）
+    dynamic_obstacles: RigidObjectCollectionCfg | None = mdp.make_global_obstacle_collection_cfg(count=100)
 
     # 灯光
     dome_light = AssetBaseCfg(
@@ -114,8 +114,9 @@ class ActionsCfg:
     # 无人机三维世界系速度指令 [vx, vy, vz]（m/s）
     uav_velocity = mdp.UavVelocityActionCfg(asset_name="robot")
 
-    # 全局动态障碍物运动项：不消耗动作维度，在每个物理步前推进障碍物。
-    global_obstacle_motion = mdp.GlobalObstacleMotionActionCfg()
+    # 全局动态障碍物运动项：不消耗动作维度，在每个物理步前推进障碍物；
+    # 场景中没有障碍物集合时动作项自动禁用。
+    global_obstacle_motion: mdp.GlobalObstacleMotionActionCfg | None = mdp.GlobalObstacleMotionActionCfg()
 
 
 @configclass
@@ -129,7 +130,7 @@ class ObservationsCfg:
         state = ObsTerm(func=mdp.state_obs, params={"asset_cfg": SceneEntityCfg("robot")})
         lidar = ObsTerm(func=mdp.lidar_obs, params={"asset_cfg": SceneEntityCfg("lidar")})
         direction = ObsTerm(func=mdp.direction_obs)
-        dynamic_obstacle = ObsTerm(func=mdp.dynamic_obstacle_obs)
+        dynamic_obstacle: ObsTerm | None = ObsTerm(func=mdp.dynamic_obstacle_obs)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
@@ -168,7 +169,7 @@ class TerminationsCfg:
     """MDP 的终止项配置。"""
 
     static_collision = DoneTerm(func=mdp.static_collision, params={"asset_cfg": SceneEntityCfg("lidar")})
-    dynamic_collision = DoneTerm(func=mdp.dynamic_collision)
+    dynamic_collision: DoneTerm | None = DoneTerm(func=mdp.dynamic_collision)
     out_of_bounds = DoneTerm(func=mdp.out_of_bounds)
     success = DoneTerm(func=mdp.success)
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
@@ -199,6 +200,11 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
     # 后初始化
     def __post_init__(self) -> None:
         """完成环境配置的后初始化。"""
+        # 动态障碍物大开关：场景中没有刚体集合时，关闭动作、观测与终止相关项
+        if self.scene.dynamic_obstacles is None:
+            self.actions.global_obstacle_motion = None
+            self.observations.policy.dynamic_obstacle = None
+            self.terminations.dynamic_collision = None
         # 通用配置
         self.decimation = 1
         self.episode_length_s = 5

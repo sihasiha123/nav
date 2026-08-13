@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""全局动态障碍物的配置、集合类、运动引擎与动作项接入。"""
+"""全局动态障碍物：配置生成、集合类、运动引擎与动作项接入。"""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg, RigidObjectCollection, RigidObjectCollectionCfg
 from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
+from isaaclab.envs.utils.io_descriptors import GenericActionIODescriptor
 from isaaclab.managers import ActionTerm, ActionTermCfg
 from isaaclab.utils import configclass
 
@@ -24,7 +25,7 @@ __all__ = [
     "GlobalObstacleManager",
     "GlobalObstacleMotionCfg",
     "get_global_obstacle_manager",
-    "initialize_global_obstacles",
+    "has_scene_entity",
     "make_global_obstacle_collection_cfg",
     "step_global_obstacles",
 ]
@@ -35,10 +36,6 @@ class GlobalRigidObjectCollection(RigidObjectCollection):
 
     def reset(self, env_ids=None, object_ids=None) -> None:
         """忽略场景重置。"""
-        # 全局集合只有一个 instance，而 scene.reset() 传入的 env_ids 是 num_envs 维
-        # 机器人索引，与集合的 instance 维度不匹配，因此完全忽略场景重置。
-        # 障碍物每次训练都从新进程的 spawn 状态开始，由管理器懒初始化复位，
-        # 不依赖场景重置；父类 reset() 仅清 wrench 缓冲，本集合不使用 wrench。
         pass
 
 
@@ -48,14 +45,17 @@ def make_global_obstacle_collection_cfg(
     margin: float = 2.0,
     obstacle_size: tuple[float, float, float] = (0.5, 0.5, 1.0),
     obstacle_height: float = 1.5,
-) -> RigidObjectCollectionCfg:
+) -> RigidObjectCollectionCfg | None:
     """按照近似正方形网格创建一套全局障碍物集合。
 
     配置中的初始位置同时作为运动原点，后续运行时管理器可以从
-    ``default_object_state`` 中读取这些位置。
+    ``default_object_state`` 中读取这些位置。``count <= 0`` 时返回
+    ``None``，表示禁用动态障碍物。
     """
-    if count <= 0:
-        raise ValueError(f"Obstacle count must be positive, received: {count}.")
+    if count < 0:
+        raise ValueError(f"Obstacle count must be non-negative, received: {count}.")
+    if count == 0:
+        return None
     if margin < 0.0:
         raise ValueError(f"Obstacle margin must be non-negative, received: {margin}.")
 
@@ -155,7 +155,7 @@ class GlobalObstacleManager:
         self._position_w: torch.Tensor
         self._target_pos_w: torch.Tensor
         self._linear_velocity_w: torch.Tensor
-        self._angular_velocity_w: torch.Tensor
+        self._velocity_w: torch.Tensor
         self._speed: torch.Tensor
         self._pose_w: torch.Tensor
 
@@ -173,7 +173,11 @@ class GlobalObstacleManager:
         self._position_w = self._pose_w[..., :3].clone()
         self._target_pos_w = self._anchor_pos_w.clone()
         self._linear_velocity_w = torch.zeros_like(self._position_w)
-        self._angular_velocity_w = torch.zeros_like(self._position_w)
+        self._velocity_w = torch.zeros(
+            (*self._position_w.shape[:-1], 6),
+            dtype=self._position_w.dtype,
+            device=self._position_w.device,
+        )
         self._speed = torch.empty(
             (*self._position_w.shape[:-1], 1),
             dtype=self._position_w.dtype,
@@ -210,13 +214,13 @@ class GlobalObstacleManager:
 
         self._position_w.add_(displacement)
         self._linear_velocity_w.copy_(displacement / dt)
+        self._velocity_w[..., :3] = self._linear_velocity_w
         self._pose_w[..., :3].copy_(self._position_w)
 
-        # 场景配置使用运动学刚体，因此直接按脚本写入位姿和速度。角速度保持为零。
-        # 速度写入 PhysX 后，无人机与障碍物接触时碰撞响应能使用真实的相对速度。
-        link_velocity = torch.cat([self._linear_velocity_w, self._angular_velocity_w], dim=-1)
+        # 运动学刚体直接按脚本写入位姿和速度（角速度恒为零）；
+        # 速度进 PhysX 后，无人机与障碍物接触时碰撞响应使用真实相对速度。
         self.asset.write_object_link_pose_to_sim(self._pose_w)
-        self.asset.write_object_link_velocity_to_sim(link_velocity)
+        self.asset.write_object_link_velocity_to_sim(self._velocity_w)
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
@@ -285,12 +289,13 @@ def get_global_obstacle_manager(
     return manager
 
 
-def initialize_global_obstacles(
-    env: ManagerBasedRLEnv,
-    cfg: GlobalObstacleMotionCfg | None = None,
-) -> None:
-    """初始化全局运动状态，但不推进仿真。"""
-    get_global_obstacle_manager(env, cfg).initialize()
+def has_scene_entity(env: ManagerBasedEnv, asset_name: str) -> bool:
+    """检查场景中是否注册了指定实体。"""
+    try:
+        env.scene[asset_name]
+        return True
+    except KeyError:
+        return False
 
 
 def step_global_obstacles(
@@ -308,15 +313,26 @@ class GlobalObstacleMotionAction(ActionTerm):
 
     该动作项不消耗策略动作（``action_dim`` 为 0），只在每个物理步的
     ``apply_actions()`` 中推进一次全局障碍物。障碍物不随单个机器人环境
-    重置，因此 ``reset()`` 为空操作。
+    重置；场景中没有障碍物集合时该动作项自动禁用。
     """
 
     cfg: GlobalObstacleMotionActionCfg
     """动作项配置。"""
 
     def __init__(self, cfg: GlobalObstacleMotionActionCfg, env: ManagerBasedEnv) -> None:
-        # 初始化动作项，并从场景中解析 ``cfg.asset_name`` 对应的实体
-        super().__init__(cfg, env)
+        if not has_scene_entity(env, cfg.asset_name):
+            # 场景中没有动态障碍物集合（例如 count=0）：保持禁用，不解析实体
+            self.cfg = cfg
+            self._env = env
+            self._asset = None
+            self._IO_descriptor = GenericActionIODescriptor()
+            self._export_IO_descriptor = True
+            self._debug_vis_handle = None
+            self._enabled = False
+        else:
+            # 初始化动作项，并从场景中解析 ``cfg.asset_name`` 对应的实体
+            super().__init__(cfg, env)
+            self._enabled = True
         # 创建空的原始/处理动作缓冲（维度为 0）
         self._raw_actions = torch.zeros((self.num_envs, 0), device=self.device, dtype=torch.float32)
         self._processed_actions = self._raw_actions
@@ -342,12 +358,9 @@ class GlobalObstacleMotionAction(ActionTerm):
 
     def apply_actions(self) -> None:
         """在每个物理步前推进一次全局障碍物。"""
+        if not self._enabled:
+            return
         step_global_obstacles(self._env)
-
-    def reset(self, env_ids=None) -> None:
-        """全局障碍物不随单个机器人环境重置。"""
-        pass
-
 
 @configclass
 class GlobalObstacleMotionActionCfg(ActionTermCfg):

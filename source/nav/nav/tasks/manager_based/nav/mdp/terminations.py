@@ -12,7 +12,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-from .dynamic import get_global_obstacle_manager
+from .dynamic import get_global_obstacle_manager, has_scene_entity
 from .events import get_nav_task_buffer
 from .observations import _lidar_distance, _obstacle_size
 
@@ -39,6 +39,9 @@ def dynamic_collision(
     margin: float = 0.3,
 ) -> torch.Tensor:
     """动态障碍碰撞：检查全部障碍物的几何距离（2D + 高度分别判断）。"""
+    if not has_scene_entity(env, "dynamic_obstacles"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
     drone_pos = env.scene["robot"].data.root_state_w[:, 0:3]
     manager = get_global_obstacle_manager(env)
     obstacle_pos_w = manager.position_w[0]

@@ -12,7 +12,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-from .dynamic import get_global_obstacle_manager
+from .dynamic import get_global_obstacle_manager, has_scene_entity
 from .events import get_nav_task_buffer
 
 __all__ = [
@@ -87,8 +87,8 @@ def state_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor
     distance_2d = torch.linalg.norm(target_dir_w[:, :2], dim=-1, keepdim=True)
     distance_z = target_dir_w[:, 2:3]
     target_dir_unit = target_dir_w / distance.clamp_min(1.0e-6)
-    target_dir_goal = vec_to_new_frame(target_dir_unit, goal_direction)
-    drone_vel_goal = vec_to_new_frame(drone_lin_vel_w, goal_direction)
+    target_dir_goal = vec_to_new_frame(target_dir_unit, goal_direction).squeeze(1)
+    drone_vel_goal = vec_to_new_frame(drone_lin_vel_w, goal_direction).squeeze(1)
 
     return torch.cat([target_dir_goal, distance_2d, distance_z, drone_vel_goal], dim=-1)
 
@@ -127,6 +127,9 @@ def dynamic_obstacle_obs(
         device=env.device,
     )
 
+    if not has_scene_entity(env, "dynamic_obstacles"):
+        return dynamic_obstacle
+
     manager = get_global_obstacle_manager(env)
     obstacle_pos_w = manager.position_w[0]
     obstacle_vel_w = manager.linear_velocity_w[0]
@@ -134,47 +137,45 @@ def dynamic_obstacle_obs(
     num_obstacles = obstacle_pos_w.shape[0]
     num_observed = min(num_observed, num_obstacles)
 
-    if num_observed <= 0:
-        return dynamic_obstacle
+    if num_observed > 0:
+        rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos_w.unsqueeze(1)
+        distance_2d_all = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)
+        nearest_ids = torch.topk(distance_2d_all, k=num_observed, largest=False).indices
+        range_mask = torch.gather(distance_2d_all, 1, nearest_ids) > lidar_range
 
-    rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos_w.unsqueeze(1)
-    distance_2d_all = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)
-    nearest_ids = torch.topk(distance_2d_all, k=num_observed, largest=False).indices
-    range_mask = torch.gather(distance_2d_all, 1, nearest_ids) > lidar_range
+        gather_ids = nearest_ids.unsqueeze(-1).expand(-1, -1, 3)
+        rel_pos_w = torch.gather(rel_pos_w, 1, gather_ids)
+        rel_pos_goal = vec_to_new_frame(rel_pos_w, goal_direction)
+        rel_pos_goal[range_mask] = 0.0
 
-    gather_ids = nearest_ids.unsqueeze(-1).expand(-1, -1, 3)
-    rel_pos_w = torch.gather(rel_pos_w, 1, gather_ids)
-    rel_pos_goal = vec_to_new_frame(rel_pos_w, goal_direction)
-    rel_pos_goal[range_mask] = 0.0
+        obstacle_vel_w = obstacle_vel_w[nearest_ids]
+        obstacle_vel_w[range_mask] = 0.0
+        obstacle_vel_goal = vec_to_new_frame(obstacle_vel_w, goal_direction)
 
-    obstacle_vel_w = obstacle_vel_w[nearest_ids]
-    obstacle_vel_w[range_mask] = 0.0
-    obstacle_vel_goal = vec_to_new_frame(obstacle_vel_w, goal_direction)
+        obstacle_size = obstacle_size.unsqueeze(0).expand(env.num_envs, -1, -1)
+        obstacle_size = torch.gather(obstacle_size, 1, gather_ids)
+        obstacle_width = obstacle_size[:, :, 0:1]
+        obstacle_height = obstacle_size[:, :, 2:3]
 
-    obstacle_size = obstacle_size.unsqueeze(0).expand(env.num_envs, -1, -1)
-    obstacle_size = torch.gather(obstacle_size, 1, gather_ids)
-    obstacle_width = obstacle_size[:, :, 0:1]
-    obstacle_height = obstacle_size[:, :, 2:3]
+        rel_distance = torch.linalg.norm(rel_pos_w, dim=-1, keepdim=True)
+        rel_distance_2d = torch.linalg.norm(rel_pos_goal[:, :, :2], dim=-1, keepdim=True)
+        rel_distance_z = rel_pos_goal[:, :, 2:3]
+        rel_pos_goal_unit = rel_pos_goal / rel_distance.clamp_min(1.0e-6)
 
-    rel_distance = torch.linalg.norm(rel_pos_w, dim=-1, keepdim=True)
-    rel_distance_2d = torch.linalg.norm(rel_pos_goal[:, :, :2], dim=-1, keepdim=True)
-    rel_distance_z = rel_pos_goal[:, :, 2:3]
-    rel_pos_goal_unit = rel_pos_goal / rel_distance.clamp_min(1.0e-6)
+        width_category = obstacle_width / 0.25 - 1.0
+        height_category = torch.where(obstacle_height > 1.0, torch.zeros_like(obstacle_height), obstacle_height)
+        width_category[range_mask] = 0.0
+        height_category[range_mask] = 0.0
 
-    width_category = obstacle_width / 0.25 - 1.0
-    height_category = torch.where(obstacle_height > 1.0, torch.zeros_like(obstacle_height), obstacle_height)
-    width_category[range_mask] = 0.0
-    height_category[range_mask] = 0.0
-
-    dynamic_obstacle[:, 0, :num_observed, :] = torch.cat(
-        [
-            rel_pos_goal_unit,
-            rel_distance_2d,
-            rel_distance_z,
-            obstacle_vel_goal,
-            width_category,
-            height_category,
-        ],
-        dim=-1,
-    )
+        dynamic_obstacle[:, 0, :num_observed, :] = torch.cat(
+            [
+                rel_pos_goal_unit,
+                rel_distance_2d,
+                rel_distance_z,
+                obstacle_vel_goal,
+                width_category,
+                height_category,
+            ],
+            dim=-1,
+        )
     return dynamic_obstacle

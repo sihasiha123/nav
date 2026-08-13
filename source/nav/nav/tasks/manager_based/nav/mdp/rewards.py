@@ -12,7 +12,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-from .dynamic import get_global_obstacle_manager
+from .dynamic import get_global_obstacle_manager, has_scene_entity
 from .events import get_nav_task_buffer
 from .observations import _lidar_distance, _obstacle_size
 
@@ -51,36 +51,37 @@ def navigation_reward(
     # 动态障碍（最近 5 个）
     dynamic_collision = torch.zeros(env.num_envs, 1, dtype=torch.bool, device=env.device)
     penalty_dynamic = torch.zeros(env.num_envs, 1, device=env.device)
-    manager = get_global_obstacle_manager(env)
-    obstacle_pos_w = manager.position_w[0]
-    obstacle_size = _obstacle_size(env)
-    num_obstacles = obstacle_pos_w.shape[0]
-    num_observed = min(5, num_obstacles)
-    if num_observed > 0:
-        rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos_w.unsqueeze(1)
-        distance_2d_all = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)
-        nearest_ids = torch.topk(distance_2d_all, k=num_observed, largest=False).indices
-        range_mask = torch.gather(distance_2d_all, 1, nearest_ids) > lidar_range
+    if has_scene_entity(env, "dynamic_obstacles"):
+        manager = get_global_obstacle_manager(env)
+        obstacle_pos_w = manager.position_w[0]
+        obstacle_size = _obstacle_size(env)
+        num_obstacles = obstacle_pos_w.shape[0]
+        num_observed = min(5, num_obstacles)
+        if num_observed > 0:
+            rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos_w.unsqueeze(1)
+            distance_2d_all = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)
+            nearest_ids = torch.topk(distance_2d_all, k=num_observed, largest=False).indices
+            range_mask = torch.gather(distance_2d_all, 1, nearest_ids) > lidar_range
 
-        gather_ids = nearest_ids.unsqueeze(-1).expand(-1, -1, 3)
-        rel_pos_w = torch.gather(rel_pos_w, 1, gather_ids)
-        obstacle_size = obstacle_size.unsqueeze(0).expand(env.num_envs, -1, -1)
-        obstacle_size = torch.gather(obstacle_size, 1, gather_ids)
-        obstacle_width = obstacle_size[:, :, 0:1]
-        obstacle_height = obstacle_size[:, :, 2:3]
+            gather_ids = nearest_ids.unsqueeze(-1).expand(-1, -1, 3)
+            rel_pos_w = torch.gather(rel_pos_w, 1, gather_ids)
+            obstacle_size = obstacle_size.unsqueeze(0).expand(env.num_envs, -1, -1)
+            obstacle_size = torch.gather(obstacle_size, 1, gather_ids)
+            obstacle_width = obstacle_size[:, :, 0:1]
+            obstacle_height = obstacle_size[:, :, 2:3]
 
-        distance_2d = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1, keepdim=True)
-        distance_z = rel_pos_w[:, :, 2:3].abs()
-        distance_2d[range_mask] = float("inf")
-        distance_z[range_mask] = float("inf")
-        collision_2d = distance_2d <= obstacle_width * 0.5 + 0.3
-        collision_z = distance_z <= obstacle_height * 0.5 + 0.3
-        dynamic_collision = (collision_2d & collision_z).any(dim=1)
+            distance_2d = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1, keepdim=True)
+            distance_z = rel_pos_w[:, :, 2:3].abs()
+            distance_2d[range_mask] = float("inf")
+            distance_z[range_mask] = float("inf")
+            collision_2d = distance_2d <= obstacle_width * 0.5 + 0.3
+            collision_z = distance_z <= obstacle_height * 0.5 + 0.3
+            dynamic_collision = (collision_2d & collision_z).any(dim=1)
 
-        dynamic_clearance = torch.linalg.norm(rel_pos_w, dim=-1) - obstacle_width.squeeze(-1) * 0.5
-        dynamic_clearance[range_mask] = lidar_range
-        dynamic_clearance = dynamic_clearance.clamp(min=0.0, max=lidar_range)
-        penalty_dynamic = torch.relu(dynamic_safe_distance - dynamic_clearance).pow(2).mean(dim=-1, keepdim=True)
+            dynamic_clearance = torch.linalg.norm(rel_pos_w, dim=-1) - obstacle_width.squeeze(-1) * 0.5
+            dynamic_clearance[range_mask] = lidar_range
+            dynamic_clearance = dynamic_clearance.clamp(min=0.0, max=lidar_range)
+            penalty_dynamic = torch.relu(dynamic_safe_distance - dynamic_clearance).pow(2).mean(dim=-1, keepdim=True)
 
     # 高度范围
     height_min = buffer.height_range[:, 0:1]
