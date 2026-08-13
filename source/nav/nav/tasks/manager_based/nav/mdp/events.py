@@ -59,12 +59,19 @@ def reset_nav_task(
     env_ids: torch.Tensor,
     map_range: tuple[float, float, float] = (20.0, 20.0, 6.0),
     start_z_range: tuple[float, float] = (0.5, 2.5),
+    boundary_offset: float = 2.0,
 ) -> None:
-    """从地图边界随机采样起点，目标放在对侧边界，无人机 yaw 朝向目标。"""
+    """从地图外缘平地随机采样起点，目标放在对侧外缘，无人机 yaw 朝向目标。
+
+    起点和目标放在 ``map_range + boundary_offset`` 处，落在 terrain 的平地
+    边框上，避免 spawn 在静态障碍物内部。
+    """
     robot = env.scene["robot"]
     buffer = get_nav_task_buffer(env)
     num_reset_envs = env_ids.size(0)
     x_range, y_range, z_range = map_range
+    x_bound = x_range + boundary_offset
+    y_bound = y_range + boundary_offset
 
     # 四条边界的掩码与偏移：side 0=+y、1=-y、2=+x、3=-x
     masks = torch.tensor(
@@ -78,28 +85,28 @@ def reset_nav_task(
     )
     shifts = torch.tensor(
         [
-            [0.0, y_range, 0.0],
-            [0.0, -y_range, 0.0],
-            [x_range, 0.0, 0.0],
-            [-x_range, 0.0, 0.0],
+            [0.0, y_bound, 0.0],
+            [0.0, -y_bound, 0.0],
+            [x_bound, 0.0, 0.0],
+            [-x_bound, 0.0, 0.0],
         ],
         device=env.device,
     )
 
     start_side = torch.randint(0, 4, (num_reset_envs,), device=env.device)
     start_pos = torch.empty((num_reset_envs, 3), device=env.device)
-    start_pos[:, 0] = -x_range + 2.0 * x_range * torch.rand(num_reset_envs, device=env.device)
-    start_pos[:, 1] = -y_range + 2.0 * y_range * torch.rand(num_reset_envs, device=env.device)
+    start_pos[:, 0] = -x_bound + 2.0 * x_bound * torch.rand(num_reset_envs, device=env.device)
+    start_pos[:, 1] = -y_bound + 2.0 * y_bound * torch.rand(num_reset_envs, device=env.device)
     z_min, z_max = start_z_range
     start_pos[:, 2] = z_min + (min(z_max, z_range) - z_min) * torch.rand(num_reset_envs, device=env.device)
     start_pos = start_pos * masks[start_side] + shifts[start_side]
 
-    # 目标放在起点对侧边界
+    # 目标放在起点对侧外缘
     target_pos = start_pos.clone()
-    target_pos[start_side == 0, 1] = -y_range
-    target_pos[start_side == 1, 1] = y_range
-    target_pos[start_side == 2, 0] = -x_range
-    target_pos[start_side == 3, 0] = x_range
+    target_pos[start_side == 0, 1] = -y_bound
+    target_pos[start_side == 1, 1] = y_bound
+    target_pos[start_side == 2, 0] = -x_bound
+    target_pos[start_side == 3, 0] = x_bound
 
     target_dir = target_pos - start_pos
     yaw = torch.atan2(target_dir[:, 1], target_dir[:, 0])

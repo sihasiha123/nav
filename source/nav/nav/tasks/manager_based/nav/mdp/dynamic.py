@@ -3,11 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""全局动态障碍物：配置生成、集合类、运动引擎与动作项接入。"""
+"""全局动态障碍物：运动引擎、动作项接入、场景配置生成。"""
 
 from __future__ import annotations
 
 import math
+import random
 
 import torch
 
@@ -31,75 +32,9 @@ __all__ = [
 ]
 
 
-class GlobalRigidObjectCollection(RigidObjectCollection):
-    """不会随并行环境重置的全局刚体集合。"""
-
-    def reset(self, env_ids=None, object_ids=None) -> None:
-        """忽略场景重置。"""
-        pass
-
-
-def make_global_obstacle_collection_cfg(
-    count: int = 100,
-    terrain_size: tuple[float, float] = (40.0, 40.0),
-    margin: float = 2.0,
-    obstacle_size: tuple[float, float, float] = (0.5, 0.5, 1.0),
-    obstacle_height: float = 1.5,
-) -> RigidObjectCollectionCfg | None:
-    """按照近似正方形网格创建一套全局障碍物集合。
-
-    配置中的初始位置同时作为运动原点，后续运行时管理器可以从
-    ``default_object_state`` 中读取这些位置。``count <= 0`` 时返回
-    ``None``，表示禁用动态障碍物。
-    """
-    if count < 0:
-        raise ValueError(f"Obstacle count must be non-negative, received: {count}.")
-    if count == 0:
-        return None
-    if margin < 0.0:
-        raise ValueError(f"Obstacle margin must be non-negative, received: {margin}.")
-
-    terrain_width, terrain_length = terrain_size
-    usable_width = terrain_width - 2.0 * margin
-    usable_length = terrain_length - 2.0 * margin
-    if usable_width <= 0.0 or usable_length <= 0.0:
-        raise ValueError("Obstacle margin leaves no usable terrain area.")
-
-    num_cols = math.ceil(math.sqrt(count))
-    num_rows = math.ceil(count / num_cols)
-    cell_width = usable_width / num_cols
-    cell_length = usable_length / num_rows
-
-    obstacle_cfgs: dict[str, RigidObjectCfg] = {}
-    for obstacle_index in range(count):
-        row, col = divmod(obstacle_index, num_cols)
-        x = -0.5 * terrain_width + margin + (col + 0.5) * cell_width
-        y = -0.5 * terrain_length + margin + (row + 0.5) * cell_length
-
-        obstacle_name = f"obstacle_{obstacle_index:03d}"
-        obstacle_cfgs[obstacle_name] = RigidObjectCfg(
-            prim_path=f"/World/Dynamic/Obstacle_{obstacle_index:03d}",
-            spawn=sim_utils.CuboidCfg(
-                size=obstacle_size,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    kinematic_enabled=True,
-                    disable_gravity=True,
-                ),
-                mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-                collision_props=sim_utils.CollisionPropertiesCfg(),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.2, 0.15)),
-            ),
-            init_state=RigidObjectCfg.InitialStateCfg(pos=(x, y, obstacle_height)),
-            collision_group=-1,
-        )
-
-    return RigidObjectCollectionCfg(
-        class_type=GlobalRigidObjectCollection,
-        rigid_objects=obstacle_cfgs,
-    )
-
-
-_MANAGER_ATTRIBUTE = "_nav_global_obstacle_manager"
+##
+# 运动参数
+##
 
 
 @configclass
@@ -117,6 +52,11 @@ class GlobalObstacleMotionCfg:
 
     arrival_threshold: float = 0.05
     """判定到达航点并重新采样的距离阈值，单位为 m。"""
+
+
+##
+# 运动引擎
+##
 
 
 class GlobalObstacleManager:
@@ -277,6 +217,14 @@ class GlobalObstacleManager:
             raise ValueError("arrival_threshold must be non-negative.")
 
 
+##
+# 外部接口
+##
+
+
+_MANAGER_ATTRIBUTE = "_nav_global_obstacle_manager"
+
+
 def get_global_obstacle_manager(
     env: ManagerBasedRLEnv,
     cfg: GlobalObstacleMotionCfg | None = None,
@@ -306,6 +254,11 @@ def step_global_obstacles(
     """推进全局障碍物一次，应在物理仿真前调用。"""
     physics_dt = env.physics_dt if dt is None else dt
     get_global_obstacle_manager(env, cfg).step(physics_dt)
+
+
+##
+# 框架接入（动作项）
+##
 
 
 class GlobalObstacleMotionAction(ActionTerm):
@@ -362,6 +315,7 @@ class GlobalObstacleMotionAction(ActionTerm):
             return
         step_global_obstacles(self._env)
 
+
 @configclass
 class GlobalObstacleMotionActionCfg(ActionTermCfg):
     """驱动全局动态障碍物运动的动作项配置。"""
@@ -371,3 +325,85 @@ class GlobalObstacleMotionActionCfg(ActionTermCfg):
 
     asset_name: str = "dynamic_obstacles"
     """场景中注册的全局动态障碍物集合名称。"""
+
+
+##
+# 场景配置生成
+##
+
+
+class GlobalRigidObjectCollection(RigidObjectCollection):
+    """不会随并行环境重置的全局刚体集合。"""
+
+    def reset(self, env_ids=None, object_ids=None) -> None:
+        """忽略场景重置。"""
+        pass
+
+
+def make_global_obstacle_collection_cfg(
+    count: int = 100,
+    terrain_size: tuple[float, float] = (40.0, 40.0),
+    margin: float = 2.0,
+    obstacle_size: tuple[float, float, float] = (0.5, 0.5, 1.0),
+    obstacle_height: float = 1.5,
+    obstacle_height_range: tuple[float, float] | None = None,
+) -> RigidObjectCollectionCfg | None:
+    """按照近似正方形网格创建一套全局障碍物集合。
+
+    配置中的初始位置同时作为运动原点，后续运行时管理器可以从
+    ``default_object_state`` 中读取这些位置。``count <= 0`` 时返回
+    ``None``，表示禁用动态障碍物。传入 ``obstacle_height_range`` 时，
+    每个障碍物的中心高度在范围内独立随机采样。
+    """
+    if count < 0:
+        raise ValueError(f"Obstacle count must be non-negative, received: {count}.")
+    if count == 0:
+        return None
+    if margin < 0.0:
+        raise ValueError(f"Obstacle margin must be non-negative, received: {margin}.")
+    if obstacle_height_range is not None:
+        if obstacle_height_range[0] < 0.0 or obstacle_height_range[1] < obstacle_height_range[0]:
+            raise ValueError(
+                f"obstacle_height_range must satisfy 0 <= min <= max, received: {obstacle_height_range}."
+            )
+
+    terrain_width, terrain_length = terrain_size
+    usable_width = terrain_width - 2.0 * margin
+    usable_length = terrain_length - 2.0 * margin
+    if usable_width <= 0.0 or usable_length <= 0.0:
+        raise ValueError("Obstacle margin leaves no usable terrain area.")
+
+    num_cols = math.ceil(math.sqrt(count))
+    num_rows = math.ceil(count / num_cols)
+    cell_width = usable_width / num_cols
+    cell_length = usable_length / num_rows
+
+    obstacle_cfgs: dict[str, RigidObjectCfg] = {}
+    for obstacle_index in range(count):
+        row, col = divmod(obstacle_index, num_cols)
+        x = -0.5 * terrain_width + margin + (col + 0.5) * cell_width
+        y = -0.5 * terrain_length + margin + (row + 0.5) * cell_length
+
+        obstacle_name = f"obstacle_{obstacle_index:03d}"
+        if obstacle_height_range is not None:
+            obstacle_height = random.uniform(*obstacle_height_range)
+        obstacle_cfgs[obstacle_name] = RigidObjectCfg(
+            prim_path=f"/World/Dynamic/Obstacle_{obstacle_index:03d}",
+            spawn=sim_utils.CuboidCfg(
+                size=obstacle_size,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    kinematic_enabled=True,
+                    disable_gravity=True,
+                ),
+                mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.2, 0.15)),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(pos=(x, y, obstacle_height)),
+            collision_group=-1,
+        )
+
+    return RigidObjectCollectionCfg(
+        class_type=GlobalRigidObjectCollection,
+        rigid_objects=obstacle_cfgs,
+    )

@@ -92,8 +92,12 @@ class NavSceneCfg(InteractiveSceneCfg):
         mesh_prim_paths=["/World/ground"],
     )
 
-    # 所有机器人环境共享同一套全局障碍物；count=0 时返回 None（禁用）
-    dynamic_obstacles: RigidObjectCollectionCfg | None = mdp.make_global_obstacle_collection_cfg(count=100)
+    # 所有机器人环境共享同一套全局障碍物；中心高度在无人机飞行范围内随机；
+    # count=0 时返回 None（禁用）
+    dynamic_obstacles: RigidObjectCollectionCfg | None = mdp.make_global_obstacle_collection_cfg(
+        count=100,
+        obstacle_height_range=(1.0, 2.5),
+    )
 
     # 灯光
     dome_light = AssetBaseCfg(
@@ -207,7 +211,7 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
             self.terminations.dynamic_collision = None
         # 通用配置
         self.decimation = 1
-        self.episode_length_s = 5
+        self.episode_length_s = 35
         # 查看器配置
         self.viewer.eye = (0.0, 0.0, 30.0)   # 相机在原点正上方 30m
         # 仿真配置
