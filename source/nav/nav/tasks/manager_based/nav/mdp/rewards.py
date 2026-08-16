@@ -30,6 +30,9 @@ def navigation_reward(
     static_safe_distance: float = 1.2,
     dynamic_safe_distance: float = 1.5,
     goal_radius: float = 0.5,
+    z_min: float = 0.2,
+    z_max: float = 4.0,
+    out_of_bounds_penalty: float = 120.0,
 ) -> torch.Tensor:
     """导航奖励：进展、速度、静态/动态避障、高度、平滑、时间、到达与碰撞。"""
     robot = env.scene["robot"]
@@ -101,22 +104,56 @@ def navigation_reward(
     penalty_smooth = torch.linalg.norm(drone_vel_w - buffer.prev_drone_vel_w, dim=-1, keepdim=True)
 
     collision = static_collision | dynamic_collision
+    out_of_bounds = (drone_z < z_min) | (drone_z > z_max)
     reach_goal = distance < goal_radius
     safe_reach_goal = reach_goal & ~collision
     first_reach_goal = safe_reach_goal & ~buffer.reached_goal_once
 
+    progress_term = 4.0 * reward_progress
+    goal_velocity_term = 0.5 * reward_vel.clamp(min=-2.0, max=2.0)
+    static_avoidance_term = -6.0 * penalty_static
+    dynamic_avoidance_term = -10.0 * penalty_dynamic
+    height_term = -2.0 * penalty_height
+    smoothness_term = -0.05 * penalty_smooth
+    time_term = torch.full_like(reward_progress, -0.01)
+    goal_first_term = torch.zeros_like(reward_progress)
+    goal_reached_term = torch.zeros_like(reward_progress)
+    collision_term = torch.zeros_like(reward_progress)
+    out_of_bounds_term = torch.zeros_like(reward_progress)
+    goal_first_term[first_reach_goal] = 50.0
+    goal_reached_term[safe_reach_goal] = 0.5
+    collision_term[collision] = -120.0
+    out_of_bounds_term[out_of_bounds] = -out_of_bounds_penalty
+
     reward = (
-        4.0 * reward_progress
-        + 0.5 * reward_vel.clamp(min=-2.0, max=2.0)
-        - 6.0 * penalty_static
-        - 10.0 * penalty_dynamic
-        - 2.0 * penalty_height
-        - 0.05 * penalty_smooth
-        - 0.01
+        progress_term
+        + goal_velocity_term
+        + static_avoidance_term
+        + dynamic_avoidance_term
+        + height_term
+        + smoothness_term
+        + time_term
+        + goal_first_term
+        + goal_reached_term
+        + collision_term
+        + out_of_bounds_term
     )
-    reward[first_reach_goal] += 50.0
-    reward[safe_reach_goal] += 0.5
-    reward[collision] -= 120.0
+
+    # Isaac Lab 的 RewardManager 会按 step dt 缩放 reward term。
+    # 分项日志也乘同样的尺度，方便直接和 env.step() 返回的 reward 对齐。
+    reward_scale = getattr(env, "step_dt", env.cfg.sim.dt * env.cfg.decimation)
+    buffer.reward_components["progress"][:] = progress_term.detach() * reward_scale
+    buffer.reward_components["goal_velocity"][:] = goal_velocity_term.detach() * reward_scale
+    buffer.reward_components["static_avoidance"][:] = static_avoidance_term.detach() * reward_scale
+    buffer.reward_components["dynamic_avoidance"][:] = dynamic_avoidance_term.detach() * reward_scale
+    buffer.reward_components["height"][:] = height_term.detach() * reward_scale
+    buffer.reward_components["smoothness"][:] = smoothness_term.detach() * reward_scale
+    buffer.reward_components["time"][:] = time_term.detach() * reward_scale
+    buffer.reward_components["goal_first"][:] = goal_first_term.detach() * reward_scale
+    buffer.reward_components["goal_reached"][:] = goal_reached_term.detach() * reward_scale
+    buffer.reward_components["collision"][:] = collision_term.detach() * reward_scale
+    buffer.reward_components["out_of_bounds"][:] = out_of_bounds_term.detach() * reward_scale
+    buffer.reward_components["total"][:] = reward.detach() * reward_scale
 
     # 更新历史状态
     buffer.prev_drone_vel_w[:] = drone_vel_w.detach()

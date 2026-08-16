@@ -42,6 +42,7 @@ from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: 
 import nav.tasks  # noqa: F401, E402
 from nav.tasks.manager_based.nav.agents.common import obs_to_tensordict  # noqa: E402
 from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
+from nav.tasks.manager_based.nav.mdp.events import get_nav_task_buffer  # noqa: E402
 
 
 WANDB_PROJECT = "nav-drone-rl"
@@ -146,6 +147,33 @@ class EpisodeReturnTracker:
         return completed_returns
 
 
+class RolloutRewardComponentStatistics:
+    """统计当前 rollout 的 reward 分项均值。"""
+
+    def __init__(self, env):
+        self._env = env
+        self._component_sums = {}
+        self._component_counts = {}
+
+    def update(self):
+        buffer = get_nav_task_buffer(self._env)
+        for name, component in buffer.reward_components.items():
+            component = component.detach().float()
+            if name not in self._component_sums:
+                self._component_sums[name] = torch.zeros((), dtype=torch.float32, device=self._env.device)
+                self._component_counts[name] = 0
+            self._component_sums[name] += component.sum()
+            self._component_counts[name] += component.numel()
+
+    def metrics(self):
+        metrics = {}
+        for name, component_sum in self._component_sums.items():
+            component_count = self._component_counts[name]
+            if component_count > 0:
+                metrics[f"Reward_Component/{name}_mean"] = (component_sum / component_count).item()
+        return metrics
+
+
 def collect_algo_log_items(train_info, rollout):
     return {
         "Rollout_Reward/step_mean": to_float(rollout["next", "agents", "reward"]),
@@ -176,6 +204,28 @@ def collect_terminal_log_items(env_log, algo_log):
     for display_name, source_name in result_keys.items():
         if source_name in env_log:
             log_items[f"result/{display_name}"] = env_log[source_name]
+
+    reward_component_keys = {
+        "progress": "Reward_Component/progress_mean",
+        "velocity": "Reward_Component/goal_velocity_mean",
+        "static": "Reward_Component/static_avoidance_mean",
+        "dynamic": "Reward_Component/dynamic_avoidance_mean",
+        "height": "Reward_Component/height_mean",
+        "smooth": "Reward_Component/smoothness_mean",
+        "collision": "Reward_Component/collision_mean",
+        "out_of_bounds": "Reward_Component/out_of_bounds_mean",
+    }
+    for display_name, source_name in reward_component_keys.items():
+        if source_name in env_log:
+            log_items[f"reward/{display_name}"] = env_log[source_name]
+    goal_bonus = 0.0
+    has_goal_bonus = False
+    for source_name in ("Reward_Component/goal_first_mean", "Reward_Component/goal_reached_mean"):
+        if source_name in env_log:
+            goal_bonus += env_log[source_name]
+            has_goal_bonus = True
+    if has_goal_bonus:
+        log_items["reward/goal_bonus"] = goal_bonus
 
     log_items.update(
         {
@@ -245,6 +295,7 @@ def make_agent(algo, cfg, env):
 def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
     frames = []
     env_statistics = RolloutEnvStatistics(env.unwrapped)
+    reward_component_statistics = RolloutRewardComponentStatistics(env.unwrapped)
 
     for _ in range(cfg.training_frame_num):
         action_td = agent.act(obs_td.clone())
@@ -259,6 +310,7 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
         done = terminated | truncated
         completed_returns = return_tracker.update(reward, done)
         env_statistics.update(done, completed_returns)
+        reward_component_statistics.update()
 
         next_observation = next_obs_td["agents", "observation"].detach().clone()
         current_observation = action_td["agents", "observation"].detach().clone()
@@ -304,7 +356,9 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
         obs_td = next_obs_td
 
     rollout = torch.stack(frames, dim=1)
-    return rollout, obs_td, env_statistics.metrics()
+    env_log = env_statistics.metrics()
+    env_log.update(reward_component_statistics.metrics())
+    return rollout, obs_td, env_log
 
 
 def train_ppo(env, agent, cfg, max_iterations, run_dir, save_interval, wandb_run):

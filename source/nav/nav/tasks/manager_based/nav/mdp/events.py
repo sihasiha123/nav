@@ -30,6 +30,21 @@ _TASK_BUFFER_ATTRIBUTE = "_nav_task_buffer"
 class NavTaskBuffer:
     """每个无人机 episode 的任务状态（目标、方向、历史量）。"""
 
+    REWARD_COMPONENT_NAMES = (
+        "progress",
+        "goal_velocity",
+        "static_avoidance",
+        "dynamic_avoidance",
+        "height",
+        "smoothness",
+        "time",
+        "goal_first",
+        "goal_reached",
+        "collision",
+        "out_of_bounds",
+        "total",
+    )
+
     def __init__(self, env: ManagerBasedRLEnv) -> None:
         num_envs = env.num_envs
         device = env.device
@@ -39,6 +54,10 @@ class NavTaskBuffer:
         self.prev_distance = torch.zeros(num_envs, 1, device=device)
         self.prev_drone_vel_w = torch.zeros(num_envs, 3, device=device)
         self.reached_goal_once = torch.zeros(num_envs, 1, dtype=torch.bool, device=device)
+        self.reward_components = {
+            name: torch.zeros(num_envs, 1, device=device)
+            for name in self.REWARD_COMPONENT_NAMES
+        }
 
 
 def get_nav_task_buffer(env: ManagerBasedRLEnv) -> NavTaskBuffer:
