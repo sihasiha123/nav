@@ -75,72 +75,130 @@ def to_float(value):
     return float(value)
 
 
-class EpisodeStatistics:
-    """回合统计（第一版：return / length / truncated 率）。"""
+class RolloutEnvStatistics:
+    """统计当前 rollout 内所有 done 环境的终止原因。"""
+
+    def __init__(self, env):
+        self._env = env
+        self._term_names = list(env.termination_manager.active_terms)
+        self._done_count = torch.zeros((), dtype=torch.long, device=env.device)
+        self._term_counts = {
+            term_name: torch.zeros((), dtype=torch.long, device=env.device)
+            for term_name in self._term_names
+        }
+        self._collision_count = torch.zeros((), dtype=torch.long, device=env.device)
+        self._completed_returns = []
+
+    def update(self, done, completed_returns=None):
+        done = done.reshape(-1).bool()
+        self._done_count += done.sum()
+        if completed_returns is not None and completed_returns.numel() > 0:
+            self._completed_returns.append(completed_returns.detach().float().cpu())
+        if not done.any():
+            return
+
+        termination_manager = self._env.termination_manager
+        collision_done = torch.zeros_like(done)
+        for term_name in self._term_names:
+            term_done = termination_manager.get_term(term_name).reshape(-1).bool()
+            self._term_counts[term_name] += (term_done & done).sum()
+            if term_name in ("static_collision", "dynamic_collision"):
+                collision_done |= term_done
+        self._collision_count += (collision_done & done).sum()
+
+    def metrics(self):
+        done_count = int(self._done_count.item())
+        if done_count == 0:
+            return {}
+
+        metrics = {"Rollout_Done/count": done_count}
+        denom = float(done_count)
+        for term_name, term_count in self._term_counts.items():
+            count = int(term_count.item())
+            metrics[f"Rollout_Termination/{term_name}_count"] = count
+            metrics[f"Rollout_Termination/{term_name}_rate"] = count / denom
+        collision_count = int(self._collision_count.item())
+        metrics["Rollout_Result/collision_count"] = collision_count
+        metrics["Rollout_Result/collision_rate"] = collision_count / denom
+        if self._completed_returns:
+            returns = torch.cat(self._completed_returns)
+            metrics["Rollout_Reward/done_return_mean"] = returns.mean().item()
+            metrics["Rollout_Reward/done_return_min"] = returns.min().item()
+            metrics["Rollout_Reward/done_return_max"] = returns.max().item()
+        return metrics
+
+
+class EpisodeReturnTracker:
+    """跨 rollout 维护每个并行环境当前 episode 的累计回报。"""
 
     def __init__(self, num_envs, device):
         self._returns = torch.zeros(num_envs, device=device)
-        self._lengths = torch.zeros(num_envs, device=device)
-        self._return_sum = torch.zeros((), device=device)
-        self._length_sum = torch.zeros((), device=device)
-        self._count = torch.zeros((), dtype=torch.long, device=device)
-        self._truncated_count = torch.zeros((), dtype=torch.long, device=device)
 
-    def reset_rollout(self):
-        self._return_sum.zero_()
-        self._length_sum.zero_()
-        self._count.zero_()
-        self._truncated_count.zero_()
+    def update(self, reward, done):
+        reward = reward.reshape(-1)
+        done = done.reshape(-1).bool()
+        self._returns += reward
+        if not done.any():
+            return torch.empty(0, device=reward.device)
 
-    def update(self, reward, terminated, truncated):
-        self._returns += reward.squeeze(-1)
-        self._lengths += 1
-
-        done = (terminated | truncated).squeeze(-1)
-        self._return_sum += self._returns[done].sum()
-        self._length_sum += self._lengths[done].sum()
-        self._count += done.sum()
-        self._truncated_count += truncated.squeeze(-1)[done].sum()
-
+        completed_returns = self._returns[done].clone()
         self._returns[done] = 0.0
-        self._lengths[done] = 0.0
-
-    def metrics(self):
-        count = self._count.item()
-        if count == 0:
-            return {}
-        return {
-            "Episode/return": (self._return_sum / count).item(),
-            "Episode/length": (self._length_sum / count).item(),
-            "Episode/count": count,
-            "Episode/truncated_rate": (self._truncated_count / count).item(),
-        }
+        return completed_returns
 
 
-def collect_log_items(train_info, rollout, episode_statistics):
-    log_items = {
-        "Rollout/reward_mean": to_float(rollout["next", "agents", "reward"]),
+def collect_algo_log_items(train_info, rollout):
+    return {
+        "Rollout_Reward/step_mean": to_float(rollout["next", "agents", "reward"]),
+        "Loss/actor": to_float(train_info["actor_loss"]),
+        "Loss/critic": to_float(train_info["critic_loss"]),
+        "Policy/entropy": to_float(train_info["entropy"]),
+        "GradNorm/actor": to_float(train_info["actor_grad_norm"]),
+        "GradNorm/critic": to_float(train_info["critic_grad_norm"]),
     }
-    log_items.update(episode_statistics.metrics())
+
+
+def collect_terminal_log_items(env_log, algo_log):
+    """终端只显示核心训练指标，详细统计保留给 wandb。"""
+    env_log = env_log or {}
+    log_items = {
+        "rollout/done_count": env_log.get("Rollout_Done/count", 0),
+    }
+    if "Rollout_Reward/done_return_mean" in env_log:
+        log_items["rollout/done_return_mean"] = env_log["Rollout_Reward/done_return_mean"]
+    log_items["rollout/step_reward_mean"] = algo_log["Rollout_Reward/step_mean"]
+
+    result_keys = {
+        "success_rate": "Rollout_Termination/success_rate",
+        "collision_rate": "Rollout_Result/collision_rate",
+        "out_of_bounds_rate": "Rollout_Termination/out_of_bounds_rate",
+        "time_out_rate": "Rollout_Termination/time_out_rate",
+    }
+    for display_name, source_name in result_keys.items():
+        if source_name in env_log:
+            log_items[f"result/{display_name}"] = env_log[source_name]
+
     log_items.update(
         {
-            "Loss/actor": to_float(train_info["actor_loss"]),
-            "Loss/critic": to_float(train_info["critic_loss"]),
-            "Policy/entropy": to_float(train_info["entropy"]),
-            "GradNorm/actor": to_float(train_info["actor_grad_norm"]),
-            "GradNorm/critic": to_float(train_info["critic_grad_norm"]),
+            "loss/actor": algo_log["Loss/actor"],
+            "loss/critic": algo_log["Loss/critic"],
+            "loss/entropy": algo_log["Policy/entropy"],
+            "grad/actor": algo_log["GradNorm/actor"],
+            "grad/critic": algo_log["GradNorm/critic"],
         }
     )
     return log_items
 
 
-def format_log(iteration, log_items):
+def format_log(iteration, log_items, title="TRAIN"):
     groups = {}
     for key, value in log_items.items():
-        group, name = key.split("/", maxsplit=1)
+        if "/" in key:
+            group, name = key.split("/", maxsplit=1)
+        else:
+            group, name = "Metric", key
         groups.setdefault(group, []).append((name, value))
 
-    lines = [f"[TRAIN] iteration={iteration + 1}"]
+    lines = [f"[{title}] iteration={iteration + 1}"]
     for group, metrics in groups.items():
         lines.append(f"  {group}")
         for name, value in metrics:
@@ -184,8 +242,9 @@ def make_agent(algo, cfg, env):
     raise ValueError(f"Unsupported algorithm: {algo}")
 
 
-def collect_ppo_rollout(env, agent, obs_td, cfg, episode_statistics):
+def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
     frames = []
+    env_statistics = RolloutEnvStatistics(env.unwrapped)
 
     for _ in range(cfg.training_frame_num):
         action_td = agent.act(obs_td.clone())
@@ -197,7 +256,9 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, episode_statistics):
         reward = reward.reshape(env.unwrapped.num_envs, 1)
         terminated = terminated.reshape(env.unwrapped.num_envs, 1)
         truncated = truncated.reshape(env.unwrapped.num_envs, 1)
-        episode_statistics.update(reward, terminated, truncated)
+        done = terminated | truncated
+        completed_returns = return_tracker.update(reward, done)
+        env_statistics.update(done, completed_returns)
 
         next_observation = next_obs_td["agents", "observation"].detach().clone()
         current_observation = action_td["agents", "observation"].detach().clone()
@@ -243,22 +304,25 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, episode_statistics):
         obs_td = next_obs_td
 
     rollout = torch.stack(frames, dim=1)
-    return rollout, obs_td
+    return rollout, obs_td, env_statistics.metrics()
 
 
 def train_ppo(env, agent, cfg, max_iterations, run_dir, save_interval, wandb_run):
     obs = env.reset()
     obs_td = obs_to_tensordict(obs, env.unwrapped.num_envs, env.unwrapped.device)
-    episode_statistics = EpisodeStatistics(env.unwrapped.num_envs, env.unwrapped.device)
+    return_tracker = EpisodeReturnTracker(env.unwrapped.num_envs, env.unwrapped.device)
 
     for iteration in range(max_iterations):
-        episode_statistics.reset_rollout()
-        rollout, obs_td = collect_ppo_rollout(env, agent, obs_td, cfg, episode_statistics)
+        rollout, obs_td, env_log = collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker)
         train_info = agent.update(rollout)
 
-        log_items = collect_log_items(train_info, rollout, episode_statistics)
-        print(format_log(iteration, log_items))
-        wandb_run.log(log_items, step=iteration + 1)
+        algo_log = collect_algo_log_items(train_info, rollout)
+        terminal_log = collect_terminal_log_items(env_log, algo_log)
+        print(format_log(iteration, terminal_log, title="TRAIN"))
+
+        if env_log:
+            wandb_run.log(env_log, step=iteration + 1)
+        wandb_run.log(algo_log, step=iteration + 1)
 
         if save_interval > 0 and (iteration + 1) % save_interval == 0:
             checkpoint_path = run_dir / f"checkpoint_{iteration + 1}.pt"
