@@ -132,3 +132,29 @@ find runs -name "checkpoint*.pt" | sort
 ```
 
 当前训练脚本使用 wandb offline 模式，文件保存在对应运行目录下。
+
+## 7. 绘制 iteration-return 曲线
+
+传入 `runs` 下的训练目录，默认读取 `Rollout_Reward/done_return_mean`，绘制原始曲线和 50 iteration 滑动平均曲线：
+
+```bash
+python scripts/plot_return.py runs/ppo_20260818_204907
+```
+
+也可以只写 run 目录名称：
+
+```bash
+python scripts/plot_return.py ppo_20260818_204907
+```
+
+修改滑动平均窗口：
+
+```bash
+python scripts/plot_return.py ppo_20260818_204907 --window 100
+```
+
+图片默认保存为项目根目录下、与 `runs` 同级的 `figure/<run_name>_iteration_return.png`。指定输出位置：
+
+```bash
+python scripts/plot_return.py ppo_20260818_204907 --output runs/return_20260818.png
+```

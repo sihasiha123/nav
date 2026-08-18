@@ -211,7 +211,7 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
             self.terminations.dynamic_collision = None
         # 通用配置
         self.decimation = 1
-        self.episode_length_s = 35
+        self.episode_length_s = 60
         # 查看器配置
         self.viewer.eye = (0.0, 0.0, 30.0)   # 相机在原点正上方 30m
         # 仿真配置
