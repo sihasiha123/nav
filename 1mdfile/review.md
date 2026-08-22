@@ -92,5 +92,61 @@ episodes.csv
 
 视频录制作为可选功能，不影响默认的无渲染批量评估。
 
+### 第一版实现与用法
+
+已实现：
+
+- `scripts/eval.py`
+- `PPO.act_deterministic()` 确定性均值动作接口
+
+默认评估使用 Beta 分布均值动作，不更新网络，也不录制视频。命令格式：
+
+```bash
+conda run --no-capture-output -n env_isaaclab \
+python scripts/eval.py \
+  --checkpoint runs/<run_name>/checkpoint_2000.pt \
+  --task Template-Nav-v0 \
+  --num_envs 1024 \
+  --episodes_per_env 1 \
+  --seed 0 \
+  --headless
+```
+
+主要参数：
+
+```text
+--checkpoint         必填，PPO checkpoint 路径
+--task               任务名称，默认 Template-Nav-v0
+--agent              PPO 配置入口，默认 ppo_cfg_entry_point
+--num_envs           评估并行环境数量，默认使用任务配置
+--episodes_per_env   每个并行环境完成的 episode 数，默认 1
+--seed               评估随机种子，默认 0
+--output_dir         结果目录；不指定时写入 output/eval_<时间>
+--stochastic         使用随机采样动作；默认不启用
+--headless           无界面运行 Isaac Sim
+```
+
+结果目录包含：
+
+```text
+episodes.csv    每个 episode 一行的原始统计
+summary.json    汇总统计和评估配置
+```
+
+单独指定输出目录的示例：
+
+```bash
+conda run --no-capture-output -n env_isaaclab \
+python scripts/eval.py \
+  --checkpoint runs/ppo_20260819_222322/checkpoint_2000.pt \
+  --num_envs 1024 \
+  --episodes_per_env 1 \
+  --seed 0 \
+  --headless \
+  --output_dir runs/ppo_20260819_222322/eval_checkpoint_2000
+```
+
+已完成最小 smoke test：2 个并行环境、每个 1 个 episode。两个 episode 均成功，平均 return 为 `25.18`，平均用时为 `22.36 s`。这只用于确认 checkpoint 加载、Manager step、终止分类和结果落盘链路正常，不作为正式性能结论。
+
 
 # 设计方案

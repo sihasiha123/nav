@@ -120,7 +120,7 @@ def navigation_reward(
     goal_reached_term = torch.zeros_like(reward_progress)
     collision_term = torch.zeros_like(reward_progress)
     out_of_bounds_term = torch.zeros_like(reward_progress)
-    goal_first_term[first_reach_goal] = 50.0
+    goal_first_term[first_reach_goal] = 120.0
     goal_reached_term[safe_reach_goal] = 0.5
     collision_term[collision] = -120.0
     out_of_bounds_term[out_of_bounds] = -out_of_bounds_penalty

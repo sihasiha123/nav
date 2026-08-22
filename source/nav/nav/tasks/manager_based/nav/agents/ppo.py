@@ -192,6 +192,18 @@ class PPO(nn.Module):
 
         return tensordict
 
+    @torch.no_grad()
+    def act_deterministic(self, tensordict):
+        """评估：使用 Beta 分布均值生成确定性动作。"""
+        obs = tensordict["agents", "observation"]
+        feature = self.feature_extractor(obs)
+        action_normalized = self.actor.deterministic(feature)
+        action = self._to_world_action(action_normalized, obs["direction"])
+
+        tensordict["agents", "action_normalized"] = action_normalized
+        tensordict["agents", "action"] = action
+        return tensordict
+
     def evaluate_action(self, obs, action_normalized):
         feature = self.feature_extractor(obs)
         log_prob, entropy = self.actor.evaluate_action(feature, action_normalized)

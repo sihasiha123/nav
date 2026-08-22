@@ -40,6 +40,9 @@ docker/.container.cfg
 **/videos/*
 **/wandb/*
 **/.neptune/*
+/runs/
+/output/
+/figure/
 docker/artifacts/
 *.tmp
 
