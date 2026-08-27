@@ -1,129 +1,82 @@
-# RL导航任务计划
+# 强化学习项目重建计划
 
-## 1. 当前状态
+## 设计原则
 
-项目已经完成从动力学测试到 Manager PPO 训练的主链路：
+从项目顶层按“仿真领域、任务 MDP、训练、算法”划分。环境使用官方 `ManagerBasedRLEnv`，只负责装配 Scene 和 Manager，不重复实现官方 `reset/step`。每类数据只有一个所有者；跨 step 状态由产生它的对象或有状态 Term 保存，不建立全局 `NavTaskBuffer`。
 
-- Isaac Sim 5.1、Isaac Lab 2.3.2 和 `env_isaaclab` 环境可用。
-- 无人机世界系速度控制器已通过悬停、速度跟踪和矩形航线测试。
-- Manager 场景、LiDAR、动态障碍物、reset、观测、奖励、终止和 PPO 已接通。
-- 多无人机共享一张静态地形，起点在 `+Y` 边，目标在 `-Y` 边，X 坐标均匀分布。
-- 当前场景包含约 200 个静态障碍物和 100 个全局动态障碍物。
-- 当前 episode 时长为 `60 s`，训练规模为 `1024` 个并行环境。
-
-当前训练基线：
+## 目录结构
 
 ```text
-checkpoint: runs/ppo_20260822_145608/checkpoint_2000.pt
-首次到达奖励: 120
-训练最后 200 iteration 成功率: 74.52%
-训练最后 200 iteration 总碰撞率: 23.49%
-正式 deterministic eval 成功率: 76.86%
-正式 deterministic eval 总碰撞率: 22.07%
+nav/
+├── assets/                         # 仿真领域对象
+│   ├── quadcopter.py               # 无人机资产、配置和相关状态
+│   └── dynamic.py                  # 动态障碍物完整领域模块
+├── controllers/                    # 底层控制器
+├── tasks/manager_based/nav/
+│   ├── nav_env_cfg.py              # Scene 和所有 Manager 配置
+│   └── mdp/
+│       ├── actions.py              # 策略动作和资产驱动适配器
+│       ├── commands.py             # 目标位置/速度 CommandTerm
+│       ├── observations.py         # ObservationTerm
+│       ├── rewards.py              # RewardTerm
+│       ├── terminations.py         # TerminationTerm
+│       ├── events.py               # reset/startup/interval EventTerm
+│       └── curriculum.py           # CurriculumTerm
+├── trainer/                        # rollout、批处理、训练日志
+├── algo/                           # PPO 等算法和网络更新
+└── scripts/                        # train、eval、测试入口
 ```
 
-当前主要问题不是“不会到达目标”，而是动态障碍物碰撞仍然较高，以及训练和 eval 的可复现性还不够严格。
-
-## 2. 当前原则
-
-- 以 `ppo_20260822_145608/checkpoint_2000.pt` 作为当前 baseline。
-- 评估默认使用 deterministic Beta 均值动作；stochastic eval 只用于分析探索影响。
-- 训练和 eval 的成功率、碰撞率必须使用相同的 episode 统计口径。
-- 每次只修改一类因素，不能同时改奖励、场景数量和动作策略。
-- 在 baseline 的正式 eval 完成前，不继续大幅重写奖励函数。
-
-## 3. 阶段一：固定评估协议
-
-目标：先确认当前 checkpoint 的真实表现和波动范围。
-
-- [ ]  在训练和 eval 中同时固定 Python `random`、Torch 和环境 seed。
-- [ ]  将 `reward_version`、`reset_mode`、静态/动态障碍物数量、episode 时长和 seed 写入 W&B config。
-- [ ]  固定 `num_envs=1024`、`episodes_per_env=1`、deterministic 动作作为主评估协议。
-- [ ]  使用至少 3 个 seed 重复评估 `checkpoint_1600`、`checkpoint_1900`、`checkpoint_2000`。
-- [ ]  记录成功率、静态碰撞率、动态碰撞率、越界率、超时率、平均 return 和成功到达时间。
-- [ ]  使用 `report.html` 保存每次评估结果，确认结果目录和 checkpoint 一一对应。
-
-验收条件：得到一个固定评估集和 baseline 均值/方差，能够判断后续改动是否真正有效。
-
-## 4. 阶段二：动态障碍物问题诊断
-
-目标：确认动态碰撞是观测问题、碰撞判定问题，还是奖励引导不足。
-
-- [ ]  在 2 个动态障碍物的简化场景中验证位置、速度、航点和运动范围。
-- [ ]  确认动态障碍物不会被单个无人机 reset 重置。
-- [ ]  对照 LiDAR、动态障碍物观测和几何碰撞判定，检查同一障碍物的相对位置是否一致。
-- [ ]  检查动态障碍物高度、尺寸和无人机飞行高度是否存在不合理重叠。
-- [ ]  增加动态碰撞前的最近距离、相对速度或 TTC 统计，但不先修改奖励。
-- [ ]  分别统计静态地图、动态障碍物和无障碍区域的成功率。
-
-验收条件：能够解释至少 80% 的动态碰撞，并确认碰撞统计没有误报或漏报。
-
-## 5. 阶段三：单变量动态避障调参
-
-目标：在不破坏基础导航的前提下降低动态碰撞。
-
-固定以下内容不变：
+## 职责和数据归属
 
 ```text
-静态地图
-reset 规则
-episode_length_s=60
-首次到达奖励=120
-PPO 网络和学习率
+assets/dynamic.py
+    障碍物生成、运动模型、航点、运行时状态、reset、step(dt)
+
+mdp/actions.py
+    UavVelocityAction；GlobalObstacleMotionAction 只调用 dynamic.step(dt)
+
+CommandTerm
+    当前目标命令和重采样计时器
+
+RewardTerm
+    即时奖励；需要历史值时由该 Term 自己保存并在 reset(env_ids) 清理
+
+TerminationTerm
+    成功、碰撞、越界、超时；需要历史标志时由该 Term 自己保存
+
+Recorder/RewardManager
+    episode 累计、分项奖励和诊断记录
 ```
 
-按以下顺序一次只改一项：
+动态障碍物的运动算法只存在于 `assets/dynamic.py`。由于官方 Manager 没有“每物理步脚本资产更新”这一独立 Manager，使用无策略维度的 `GlobalObstacleMotionAction` 作为薄适配器，借用 `ActionManager.apply_actions()` 的调用时机；它不重复实现运动逻辑。
 
-1. 调整动态障碍物风险的触发距离和权重。
-2. 加入相对速度/TTC 方向性风险，避免只惩罚“附近有障碍物”。
-3. 必要时调整动态碰撞终止惩罚，但不同时提高到达奖励。
-4. 比较每个版本的动态碰撞率、成功率和超时率，防止从“撞击”退化为“悬停”。
-
-每个版本至少训练相同的 iteration 数，并使用同一组 eval seed。保留成功率最高且动态碰撞率最低的 checkpoint，不以 return 单一指标选型。
-
-## 6. 阶段四：课程与泛化
-
-当单侧固定场景的动态碰撞率稳定下降后，再增加任务难度：
-
-- [ ]  先训练无动态障碍物或少量动态障碍物，确认基础避障。
-- [ ]  动态障碍物数量逐步从少量增加到当前 100 个。
-- [ ]  随机化动态障碍物初始高度、速度、航点和运动相位。
-- [ ]  保留 `+Y -> -Y` 作为基准，同时加入起点 X 和高度的小范围扰动。
-- [ ]  最后测试不同障碍布局或多个固定地图。
-
-每个课程阶段都保留固定测试集，检查新场景能力提升是否造成旧场景退化。
-
-## 7. 阶段五：正式训练与部署评估
-
-- [ ]  确认最佳奖励版本和 checkpoint。
-- [ ]  使用多个 seed 进行至少 3 次正式训练，报告均值和标准差。
-- [ ]  评估 deterministic 策略作为部署结果，stochastic 策略只作为补充实验。
-- [ ]  记录成功率、碰撞率、越界率、超时率、成功到达时间和 return 分布。
-- [ ]  对最终 checkpoint 生成 `summary.json`、`episodes.csv` 和 `report.html`。
-- [ ]  将训练命令、评估命令和结果目录写入对应日期文档。
-
-## 8. 暂不处理
-
-- 暂不把整个 `navigation` 的 `weight` 改为 `60`。
-- 暂不继续大幅提高到达奖励。
-- 暂不增加动作输出硬限制。
-- 暂不引入相机或更复杂的网络结构。
-- 暂不把训练 rollout 的成功率直接当作部署性能。
-
-## 9. 推荐执行顺序
+## 标准数据流
 
 ```text
-固定 seed 和评估协议
-        ↓
-多 seed 评估当前 checkpoint
-        ↓
-动态障碍物观测/碰撞诊断
-        ↓
-只改动态避障奖励并重新训练
-        ↓
-多 seed 对比 baseline
-        ↓
-课程训练与泛化测试
-        ↓
-正式部署评估
+reset:
+    Scene.reset
+    EventManager.apply(reset)
+    CommandManager.reset
+    各 Term.reset(env_ids)
+    ObservationManager.compute
+
+step:
+    ActionManager.process_actions
+    每个物理步：ActionManager.apply_actions -> Scene/Simulation.step -> Scene.update
+    TerminationManager.compute
+    RewardManager.compute
+    RecorderManager.record
+    reset 已结束环境
+    CommandManager.compute
+    ObservationManager.compute
 ```
+
+## 实施阶段
+
+1. 先固定环境配置、观测字典、动作维度、奖励缩放和终止名称。
+2. 建立 `assets` 模块，使无人机和动态障碍物都能独立生成、reset、更新和测试。
+3. 实现 `CommandTerm`，让 observation、reward、termination 统一读取同一目标。
+4. 保留一个整体 `NavigationReward`，把其历史缓存放进该有状态 Term，不急于拆成多个奖励类。
+5. 完成终止、事件、课程和记录器配置，再接入 Trainer 和 Algo。
+6. 使用固定 seed、多个并行环境和不同 decimation 做 reset/step smoke test，确认每个物理步只更新一次动态障碍物，且重建前后训练接口一致。
