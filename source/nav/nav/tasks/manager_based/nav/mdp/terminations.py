@@ -12,8 +12,8 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-from .dynamic import get_global_obstacle_manager, has_scene_entity
-from .events import get_nav_task_buffer
+from nav.assets.dynamic import get_global_obstacle_manager, has_scene_entity
+from .commands import get_nav_target_command
 from .observations import _lidar_distance, _obstacle_size
 
 __all__ = [
@@ -84,7 +84,7 @@ def success(
 ) -> torch.Tensor:
     """安全到达目标（到达且未碰撞）。"""
     drone_pos = env.scene["robot"].data.root_state_w[:, 0:3]
-    target_pos = get_nav_task_buffer(env).target_pos
+    target_pos = get_nav_target_command(env)[:, :3]
     distance = torch.linalg.norm(target_pos - drone_pos, dim=-1)
     reach_goal = distance < goal_radius
 

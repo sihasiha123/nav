@@ -10,10 +10,12 @@ from __future__ import annotations
 import torch
 
 from isaaclab.envs import ManagerBasedEnv
+from isaaclab.envs.utils.io_descriptors import GenericActionIODescriptor
 from isaaclab.managers import ActionTerm, ActionTermCfg
 from isaaclab.utils import configclass
 
 from nav.controllers import VelocityController, VelocityControllerCfg
+from nav.assets.dynamic import GlobalObstacleMotionCfg, get_global_obstacle_manager, has_scene_entity
 
 
 ##
@@ -112,3 +114,55 @@ class UavVelocityActionCfg(ActionTermCfg):
 
     max_velocity: float | None = None
     """速度指令裁剪上限（m/s）；为 None 时不裁剪。"""
+
+
+class GlobalObstacleMotionAction(ActionTerm):
+    """通过 ActionManager 的物理步回调驱动动态障碍物资产。"""
+
+    cfg: "GlobalObstacleMotionActionCfg"
+
+    def __init__(self, cfg: "GlobalObstacleMotionActionCfg", env: ManagerBasedEnv) -> None:
+        self._enabled = has_scene_entity(env, cfg.asset_name)
+        if self._enabled:
+            super().__init__(cfg, env)
+            motion_cfg = cfg.motion_cfg.copy()
+            motion_cfg.asset_name = cfg.asset_name
+            self._motion_manager = get_global_obstacle_manager(env, motion_cfg)
+        else:
+            # Keep the term valid when the optional scene entity is disabled.
+            self.cfg = cfg
+            self._env = env
+            self._asset = None
+            self._IO_descriptor = GenericActionIODescriptor()
+            self._debug_vis_handle = None
+            self._export_IO_descriptor = False
+        self._raw_actions = torch.zeros((env.num_envs, 0), device=env.device)
+        self._processed_actions = self._raw_actions
+
+    @property
+    def action_dim(self) -> int:
+        return 0
+
+    @property
+    def raw_actions(self) -> torch.Tensor:
+        return self._raw_actions
+
+    @property
+    def processed_actions(self) -> torch.Tensor:
+        return self._processed_actions
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        return None
+
+    def apply_actions(self) -> None:
+        if self._enabled:
+            self._motion_manager.step(self._env.physics_dt)
+
+
+@configclass
+class GlobalObstacleMotionActionCfg(ActionTermCfg):
+    """动态障碍物资产的 ActionManager 适配配置。"""
+
+    class_type: type[ActionTerm] = GlobalObstacleMotionAction
+    asset_name: str = "dynamic_obstacles"
+    motion_cfg: GlobalObstacleMotionCfg = GlobalObstacleMotionCfg()

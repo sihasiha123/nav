@@ -115,7 +115,7 @@ global_obstacle_motion = mdp.GlobalObstacleMotionActionCfg()
 state / lidar / direction / dynamic_obstacle
 ```
 
-奖励由 `mdp.navigation_reward` 计算；终止项包括静态碰撞、动态碰撞、越界、成功和超时；`reset_nav_task` 负责设置起点、目标和任务状态。
+奖励由有状态的 `mdp.NavigationReward` 计算；终止项包括静态碰撞、动态碰撞、越界、成功和超时；`reset_robot_state` 只负责设置机器人初始状态，目标由 `NavTargetCommand` 生成。
 
 ## 6. CurriculumManager 的使用
 
@@ -243,6 +243,6 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
 target = env.command_manager.get_command("target")
 ```
 
-当前导航项目没有配置 `commands`，所以 `CommandManager` 是空的。目标点由 `reset_nav_task` 写入 `NavTaskBuffer.target_pos`，`direction_obs` 和奖励函数直接读取这个 buffer；这种写法可以正常工作，不必为了使用 Manager 强行增加 command term。
+当前导航项目已配置 `commands.nav_target`。目标由 `NavTargetCommand` 唯一持有，`direction_obs`、奖励函数和成功终止项统一通过 `env.command_manager.get_command("nav_target")` 读取。
 
 注意：`VelocityController` 中的 `self.command` 是底层控制器内部的 `[yaw, vx, vy, vz]` 控制量，不是 Isaac Lab 的 `CommandManager` command。它由 `ActionManager` 的 UAV 速度动作产生。

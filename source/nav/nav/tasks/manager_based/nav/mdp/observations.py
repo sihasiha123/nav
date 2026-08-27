@@ -12,8 +12,8 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-from .dynamic import get_global_obstacle_manager, has_scene_entity
-from .events import get_nav_task_buffer
+from nav.assets.dynamic import get_global_obstacle_manager, has_scene_entity
+from .commands import get_nav_target_command
 
 __all__ = [
     "direction_obs",
@@ -61,7 +61,7 @@ def vec_to_new_frame(vec: torch.Tensor, goal_direction: torch.Tensor) -> torch.T
 
 def _goal_frame_direction(env: ManagerBasedRLEnv) -> torch.Tensor:
     """返回归一化的 2D 任务方向（goal frame x 轴），形状 ``(num_envs, 3)``。"""
-    target_dir = get_nav_task_buffer(env).target_dir.clone()
+    target_dir = get_nav_target_command(env)[:, 3:].clone()
     target_dir_2d = target_dir
     target_dir_2d[:, 2] = 0.0
     target_dir_norm = torch.linalg.norm(target_dir_2d, dim=-1, keepdim=True)
@@ -88,8 +88,7 @@ def state_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor
     drone_pos_w = root_state[:, 0:3]
     drone_lin_vel_w = root_state[:, 7:10]
 
-    buffer = get_nav_task_buffer(env)
-    target_pos_w = buffer.target_pos
+    target_pos_w = get_nav_target_command(env)[:, :3]
     target_dir_w = target_pos_w - drone_pos_w
     goal_direction = _goal_frame_direction(env)
 

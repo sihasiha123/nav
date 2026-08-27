@@ -47,7 +47,7 @@ mdp/observations.py    ObservationTerm
 mdp/rewards.py         有状态或无状态 RewardTerm
 mdp/terminations.py    TerminationTerm
 mdp/curriculum.py      CurriculumTerm
-mdp/dynamic.py         动态障碍物完整领域模块，保持整体
+assets/dynamic.py      动态障碍物完整领域模块，保持整体
 ```
 
 删除 `NavTaskBuffer`。目标由 `CommandTerm` 唯一持有，奖励历史由对应 `RewardTerm` 持有，日志数据由 `RewardManager/RecorderManager` 持有。只有无法归属于任何 Manager 且确实被多个模块共享的数据，才允许作为环境级状态保留。
@@ -57,5 +57,5 @@ mdp/dynamic.py         动态障碍物完整领域模块，保持整体
 1. 先实现 `NavTargetCommand`，让 observation、reward、termination 统一读取 `env.command_manager` 的目标。
 2. 将 `prev_distance`、`prev_drone_vel_w`、`reached_goal_once` 分别迁移到对应的有状态 Term，并实现 `reset(env_ids)`。
 3. 将 `reset_nav_task()` 拆为机器人 reset event 和 command reset，不在 event 中保存奖励或任务缓存。
-4. 删除 `NavTaskBuffer` 及 `reward_components`，改用官方 Manager 的累计值和 Recorder 记录。
+4. 逐步删除 `NavTaskBuffer` 及其兼容字段；奖励分项先由有状态 `NavigationReward` 暴露，Recorder 接入后再迁移统计记录。
 5. 用固定 seed、多个并行环境执行 reset/step smoke test，确认形状、奖励缩放和终止行为不变。

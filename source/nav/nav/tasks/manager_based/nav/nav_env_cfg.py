@@ -27,6 +27,7 @@ from . import mdp
 ##
 
 from nav.assets.quadcopter import DRONE_NO_COLLIDER_CFG
+from nav.assets.dynamic import make_global_obstacle_collection_cfg
 
 
 ##
@@ -94,7 +95,7 @@ class NavSceneCfg(InteractiveSceneCfg):
 
     # 所有机器人环境共享同一套全局障碍物；中心高度在无人机飞行范围内随机；
     # count=0 时返回 None（禁用）
-    dynamic_obstacles: RigidObjectCollectionCfg | None = mdp.make_global_obstacle_collection_cfg(
+    dynamic_obstacles: RigidObjectCollectionCfg | None = make_global_obstacle_collection_cfg(
         count=100,
         obstacle_height_range=(1.0, 2.5),
     )
@@ -150,14 +151,27 @@ class ObservationsCfg:
 class EventCfg:
     """事件项配置。"""
 
-    # 重置：从地图边界随机起点，目标放对侧，yaw 朝向目标
-    reset_nav_task = EventTerm(
-        func=mdp.reset_nav_task,
+    # 重置：从地图边界随机起点；目标由 CommandManager 生成
+    reset_robot_state = EventTerm(
+        func=mdp.reset_robot_state,
         mode="reset",
         params={
             "map_range": (20.0, 20.0, 6.0),
             "start_z_range": (0.5, 2.5),
+            "boundary_offset": 2.0,
         },
+    )
+
+
+@configclass
+class CommandsCfg:
+    """导航目标命令配置。"""
+
+    nav_target = mdp.NavTargetCommandCfg(
+        asset_name="robot",
+        map_range=(20.0, 20.0, 6.0),
+        boundary_offset=2.0,
+        resampling_time_range=(1.0e9, 1.0e9),
     )
 
 
@@ -165,7 +179,7 @@ class EventCfg:
 class RewardsCfg:
     """MDP 的奖励项配置（uav 权重）。"""
 
-    navigation = RewTerm(func=mdp.navigation_reward, weight=1.0)
+    navigation = RewTerm(func=mdp.NavigationReward, weight=1.0)
 
 
 @configclass
@@ -197,6 +211,7 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     events: EventCfg = EventCfg()
+    commands: CommandsCfg = CommandsCfg()
     # MDP 配置
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()

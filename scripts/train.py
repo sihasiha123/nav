@@ -42,7 +42,6 @@ from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: 
 import nav.tasks  # noqa: F401, E402
 from nav.tasks.manager_based.nav.agents.common import obs_to_tensordict  # noqa: E402
 from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
-from nav.tasks.manager_based.nav.mdp.events import get_nav_task_buffer  # noqa: E402
 
 
 WANDB_PROJECT = "nav-drone-rl"
@@ -156,8 +155,10 @@ class RolloutRewardComponentStatistics:
         self._component_counts = {}
 
     def update(self):
-        buffer = get_nav_task_buffer(self._env)
-        for name, component in buffer.reward_components.items():
+        reward_term = getattr(self._env, "_nav_reward_term", None)
+        if reward_term is None:
+            return
+        for name, component in reward_term.reward_components.items():
             component = component.detach().float()
             if name not in self._component_sums:
                 self._component_sums[name] = torch.zeros((), dtype=torch.float32, device=self._env.device)
