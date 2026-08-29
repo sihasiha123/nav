@@ -29,6 +29,24 @@ __all__ = [
 ##
 
 
+def _lidar_distance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, lidar_range: float) -> torch.Tensor:
+    """读取 LiDAR 距离；该实现只服务于观测项。"""
+    lidar = env.scene[asset_cfg.name]
+    ray_starts_w = lidar.data.pos_w.unsqueeze(1)
+    distance = torch.linalg.norm(lidar.data.ray_hits_w - ray_starts_w, dim=-1)
+    distance = torch.nan_to_num(distance, nan=lidar_range, posinf=lidar_range, neginf=lidar_range)
+    # 当前传感器为 36 个水平角度 x 4 个垂直通道，保留二维网格供 CNN 使用。
+    return distance.clamp_max(lidar_range).reshape(env.num_envs, 1, 36, 4)
+
+
+def _obstacle_size(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """读取动态障碍物尺寸；该实现只服务于动态障碍物观测。"""
+    collection_cfg = env.scene["dynamic_obstacles"].cfg
+    first_spawn = next(iter(collection_cfg.rigid_objects.values())).spawn
+    size = torch.tensor(first_spawn.size, device=env.device, dtype=torch.float32)
+    return size.unsqueeze(0).repeat(len(collection_cfg.rigid_objects), 1)
+
+
 def vec_to_new_frame(vec: torch.Tensor, goal_direction: torch.Tensor) -> torch.Tensor:
     """把向量转到 goal frame（x 轴沿任务方向，z 轴保持世界垂直）。"""
     if vec.dim() == 1:
@@ -70,17 +88,6 @@ def _goal_frame_direction(env: ManagerBasedRLEnv) -> torch.Tensor:
     return torch.where(target_dir_norm > 1.0e-6, target_dir_2d, fallback_dir)
 
 
-def _lidar_distance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, lidar_range: float) -> torch.Tensor:
-    """量程内归一化的 LiDAR 读数，形状 ``(num_envs, 1, 36, 4)``，越近越大。"""
-    lidar = env.scene[asset_cfg.name]
-    ray_hits_w = lidar.data.ray_hits_w
-    ray_starts_w = lidar.data.pos_w.unsqueeze(1)
-    distance = torch.linalg.norm(ray_hits_w - ray_starts_w, dim=-1)
-    distance = torch.nan_to_num(distance, nan=lidar_range, posinf=lidar_range, neginf=lidar_range)
-    lidar_obs = lidar_range - distance.clamp_max(lidar_range)
-    return lidar_obs.reshape(env.num_envs, 1, 36, 4)
-
-
 def state_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """8 维状态：目标方向(3) + 2D 距离(1) + z 距离(1) + 速度(3)，全部转 goal frame。"""
     robot = env.scene[asset_cfg.name]
@@ -104,21 +111,13 @@ def state_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor
 
 def lidar_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, lidar_range: float = 4.0) -> torch.Tensor:
     """LiDAR 距离图，形状 ``(num_envs, 1, 36, 4)``。"""
-    return _lidar_distance(env, asset_cfg, lidar_range)
+    # 几何模块返回距离；策略观测使用“越近数值越大”的接近度语义。
+    return lidar_range - _lidar_distance(env, asset_cfg, lidar_range)
 
 
 def direction_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     """固定任务方向，形状 ``(num_envs, 1, 3)``。"""
     return _goal_frame_direction(env).unsqueeze(1)
-
-
-def _obstacle_size(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """从场景集合配置读取统一障碍物尺寸，形状 ``(num_obstacles, 3)``。"""
-    collection_cfg = env.scene["dynamic_obstacles"].cfg
-    first_spawn = next(iter(collection_cfg.rigid_objects.values())).spawn
-    size = torch.tensor(first_spawn.size, device=env.device, dtype=torch.float32)
-    num_obstacles = len(collection_cfg.rigid_objects)
-    return size.unsqueeze(0).repeat(num_obstacles, 1)
 
 
 def dynamic_obstacle_obs(
@@ -142,7 +141,7 @@ def dynamic_obstacle_obs(
     manager = get_global_obstacle_manager(env)
     obstacle_pos_w = manager.position_w[0]
     obstacle_vel_w = manager.linear_velocity_w[0]
-    obstacle_size = _obstacle_size(env)
+    obstacle_dimensions = _obstacle_size(env)
     num_obstacles = obstacle_pos_w.shape[0]
     num_observed = min(num_observed, num_obstacles)
 
@@ -161,10 +160,10 @@ def dynamic_obstacle_obs(
         obstacle_vel_w[range_mask] = 0.0
         obstacle_vel_goal = vec_to_new_frame(obstacle_vel_w, goal_direction)
 
-        obstacle_size = obstacle_size.unsqueeze(0).expand(env.num_envs, -1, -1)
-        obstacle_size = torch.gather(obstacle_size, 1, gather_ids)
-        obstacle_width = obstacle_size[:, :, 0:1]
-        obstacle_height = obstacle_size[:, :, 2:3]
+        obstacle_dimensions = obstacle_dimensions.unsqueeze(0).expand(env.num_envs, -1, -1)
+        obstacle_dimensions = torch.gather(obstacle_dimensions, 1, gather_ids)
+        obstacle_width = obstacle_dimensions[:, :, 0:1]
+        obstacle_height = obstacle_dimensions[:, :, 2:3]
 
         rel_distance = torch.linalg.norm(rel_pos_w, dim=-1, keepdim=True)
         rel_distance_2d = torch.linalg.norm(rel_pos_goal[:, :, :2], dim=-1, keepdim=True)

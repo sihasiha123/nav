@@ -37,6 +37,7 @@ def reset_robot_state(
     map_range: tuple[float, float, float] = (20.0, 20.0, 6.0),
     start_z_range: tuple[float, float] = (0.5, 2.5),
     boundary_offset: float = 2.0,
+    yaw_angle: float = -1.5707963267948966,
 ) -> None:
     """从 ``+Y`` 边均匀布置无人机起点。
 
@@ -64,7 +65,7 @@ def reset_robot_state(
     )
 
     # 机器人朝向任务的固定行进方向；目标由 NavTargetCommand 生成。
-    yaw = torch.full_like(start_pos[:, 0], -torch.pi / 2.0)
+    yaw = torch.full_like(start_pos[:, 0], yaw_angle)
 
     # 写入无人机初始物理状态
     root_pose = torch.cat([start_pos + env.scene.env_origins[env_ids], yaw_to_quat(yaw)], dim=-1)

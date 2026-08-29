@@ -14,7 +14,6 @@ from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 
 from nav.assets.dynamic import get_global_obstacle_manager, has_scene_entity
 from .commands import get_nav_target_command
-from .observations import _lidar_distance, _obstacle_size
 
 __all__ = ["NavigationReward"]
 
@@ -22,6 +21,23 @@ __all__ = ["NavigationReward"]
 ##
 # 导航奖励
 ##
+
+
+def _lidar_distance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, lidar_range: float) -> torch.Tensor:
+    """读取奖励计算所需的 LiDAR 距离。"""
+    lidar = env.scene[asset_cfg.name]
+    ray_starts_w = lidar.data.pos_w.unsqueeze(1)
+    distance = torch.linalg.norm(lidar.data.ray_hits_w - ray_starts_w, dim=-1)
+    distance = torch.nan_to_num(distance, nan=lidar_range, posinf=lidar_range, neginf=lidar_range)
+    return distance.clamp_max(lidar_range)
+
+
+def _obstacle_size(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """读取奖励计算所需的动态障碍物尺寸。"""
+    collection_cfg = env.scene["dynamic_obstacles"].cfg
+    first_spawn = next(iter(collection_cfg.rigid_objects.values())).spawn
+    size = torch.tensor(first_spawn.size, device=env.device, dtype=torch.float32)
+    return size.unsqueeze(0).repeat(len(collection_cfg.rigid_objects), 1)
 
 
 class NavigationReward(ManagerTermBase):
@@ -45,7 +61,6 @@ class NavigationReward(ManagerTermBase):
         self.reward_components = {
             name: torch.zeros((env.num_envs, 1), device=env.device) for name in self._component_names
         }
-        setattr(env, "_nav_reward_term", self)
 
     def reset(self, env_ids=None) -> None:
         if env_ids is None:
@@ -87,10 +102,10 @@ class NavigationReward(ManagerTermBase):
         reward_vel = (drone_vel_w * vel_direction).sum(dim=-1, keepdim=True)
 
         # 静态障碍（LiDAR 推断）
-        lidar = _lidar_distance(env, SceneEntityCfg("lidar"), lidar_range)
-        static_clearance = (lidar_range - lidar).amin(dim=(2, 3))
+        lidar_distance_w = _lidar_distance(env, SceneEntityCfg("lidar"), lidar_range)
+        static_clearance = lidar_distance_w.amin(dim=-1, keepdim=True)
         penalty_static = torch.relu(static_safe_distance - static_clearance).pow(2)
-        static_collision = lidar.amax(dim=(2, 3)) > lidar_range - 0.3
+        static_collision = lidar_distance_w.amin(dim=-1, keepdim=True) < 0.3
 
         # 动态障碍（最近 5 个）
         dynamic_collision = torch.zeros(env.num_envs, 1, dtype=torch.bool, device=env.device)
@@ -98,7 +113,7 @@ class NavigationReward(ManagerTermBase):
         if has_scene_entity(env, "dynamic_obstacles"):
             manager = get_global_obstacle_manager(env)
             obstacle_pos_w = manager.position_w[0]
-            obstacle_size = _obstacle_size(env)
+            obstacle_dimensions = _obstacle_size(env)
             num_obstacles = obstacle_pos_w.shape[0]
             num_observed = min(5, num_obstacles)
             if num_observed > 0:
@@ -109,10 +124,10 @@ class NavigationReward(ManagerTermBase):
 
                 gather_ids = nearest_ids.unsqueeze(-1).expand(-1, -1, 3)
                 rel_pos_w = torch.gather(rel_pos_w, 1, gather_ids)
-                obstacle_size = obstacle_size.unsqueeze(0).expand(env.num_envs, -1, -1)
-                obstacle_size = torch.gather(obstacle_size, 1, gather_ids)
-                obstacle_width = obstacle_size[:, :, 0:1]
-                obstacle_height = obstacle_size[:, :, 2:3]
+                obstacle_dimensions = obstacle_dimensions.unsqueeze(0).expand(env.num_envs, -1, -1)
+                obstacle_dimensions = torch.gather(obstacle_dimensions, 1, gather_ids)
+                obstacle_width = obstacle_dimensions[:, :, 0:1]
+                obstacle_height = obstacle_dimensions[:, :, 2:3]
 
                 distance_2d = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1, keepdim=True)
                 distance_z = rel_pos_w[:, :, 2:3].abs()

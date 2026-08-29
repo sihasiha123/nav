@@ -132,7 +132,7 @@ figure/<run_name>_iteration_return.png
 
 ```bash
 python scripts/eval.py \
-  --checkpoint runs/ppo_20260819_222322/checkpoint_2000.pt \
+  --checkpoint runs/ppo_20260827_230100/checkpoint_final.pt \
   --task Template-Nav-v0 \
   --num_envs 1024 \
   --episodes_per_env 1 \
@@ -144,7 +144,7 @@ python scripts/eval.py \
 
 ```bash
 python scripts/eval.py \
-  --checkpoint runs/ppo_20260819_222322/checkpoint_2000.pt \
+  --checkpoint runs/ppo_20260827_230100/checkpoint_final.pt \
   --num_envs 1024 \
   --episodes_per_env 5 \
   --seed 0 \

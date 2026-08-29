@@ -14,7 +14,7 @@ import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg, RigidObjectCollection, RigidObjectCollectionCfg
-from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
+from isaaclab.envs import ManagerBasedEnv
 from isaaclab.utils import configclass
 
 __all__ = [
@@ -63,7 +63,8 @@ class GlobalObstacleManager:
     它不使用机器人的 ``env_ids``，应独立于单个回合，在每个物理步中只调用一次。
     """
 
-    def __init__(self, env: ManagerBasedRLEnv, cfg: GlobalObstacleMotionCfg | None = None):
+    def __init__(self, env: ManagerBasedEnv, cfg: GlobalObstacleMotionCfg | None = None):
+        self._physics_dt = env.physics_dt
         self.cfg = (cfg or GlobalObstacleMotionCfg()).copy()
         scene_asset = env.scene[self.cfg.asset_name]
         if not isinstance(scene_asset, RigidObjectCollection):
@@ -94,6 +95,11 @@ class GlobalObstacleManager:
         self._velocity_w: torch.Tensor
         self._speed: torch.Tensor
         self._pose_w: torch.Tensor
+
+    @property
+    def physics_dt(self) -> float:
+        """运动更新使用的物理时间步。"""
+        return self._physics_dt
 
     def initialize(self) -> None:
         """初始化运动原点，并为所有障碍物采样第一个航点。"""
@@ -218,18 +224,20 @@ class GlobalObstacleManager:
 ##
 
 
-_MANAGER_ATTRIBUTE = "_nav_global_obstacle_manager"
-
-
 def get_global_obstacle_manager(
-    env: ManagerBasedRLEnv,
+    env: ManagerBasedEnv,
     cfg: GlobalObstacleMotionCfg | None = None,
 ) -> GlobalObstacleManager:
-    """返回环境的全局障碍物管理器，并在第一次使用时创建它。"""
-    manager = getattr(env, _MANAGER_ATTRIBUTE, None)
+    """返回动态障碍物资产所拥有的运动管理器。
+
+    管理器引用挂在 ``GlobalRigidObjectCollection`` 资产上，而不是注入环境
+    私有字段；这样障碍物的运行时状态和运动逻辑仍由资产领域模块负责。
+    """
+    scene_asset = env.scene[cfg.asset_name if cfg is not None else "dynamic_obstacles"]
+    manager = getattr(scene_asset, "motion_manager", None)
     if manager is None:
         manager = GlobalObstacleManager(env, cfg)
-        setattr(env, _MANAGER_ATTRIBUTE, manager)
+        setattr(scene_asset, "motion_manager", manager)
     return manager
 
 
@@ -243,7 +251,7 @@ def has_scene_entity(env: ManagerBasedEnv, asset_name: str) -> bool:
 
 
 def step_global_obstacles(
-    env: ManagerBasedRLEnv,
+    env: ManagerBasedEnv,
     dt: float | None = None,
     cfg: GlobalObstacleMotionCfg | None = None,
 ) -> None:
@@ -260,9 +268,20 @@ def step_global_obstacles(
 class GlobalRigidObjectCollection(RigidObjectCollection):
     """不会随并行环境重置的全局刚体集合。"""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 运行时运动状态属于动态障碍物资产本身。
+        self.motion_manager: GlobalObstacleManager | None = None
+
     def reset(self, env_ids=None, object_ids=None) -> None:
         """忽略场景重置。"""
         pass
+
+    def write_data_to_sim(self):
+        """在场景写入阶段推进运动学障碍物，再写入其外力数据。"""
+        if self.motion_manager is not None:
+            self.motion_manager.step(self.motion_manager.physics_dt)
+        super().write_data_to_sim()
 
 
 def make_global_obstacle_collection_cfg(

@@ -155,10 +155,16 @@ class RolloutRewardComponentStatistics:
         self._component_counts = {}
 
     def update(self):
-        reward_term = getattr(self._env, "_nav_reward_term", None)
-        if reward_term is None:
+        # 通过 Isaac Lab 的公开 manager 接口定位奖励 term，不向环境对象注入私有引用。
+        try:
+            reward_cfg = self._env.reward_manager.get_term_cfg("navigation")
+        except (AttributeError, ValueError):
             return
-        for name, component in reward_term.reward_components.items():
+        reward_term = getattr(reward_cfg, "func", None)
+        reward_components = getattr(reward_term, "reward_components", None)
+        if reward_components is None:
+            return
+        for name, component in reward_components.items():
             component = component.detach().float()
             if name not in self._component_sums:
                 self._component_sums[name] = torch.zeros((), dtype=torch.float32, device=self._env.device)

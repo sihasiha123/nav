@@ -14,7 +14,6 @@ from isaaclab.managers import SceneEntityCfg
 
 from nav.assets.dynamic import get_global_obstacle_manager, has_scene_entity
 from .commands import get_nav_target_command
-from .observations import _lidar_distance, _obstacle_size
 
 __all__ = [
     "dynamic_collision",
@@ -29,14 +28,31 @@ __all__ = [
 ##
 
 
+def _lidar_distance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, lidar_range: float) -> torch.Tensor:
+    """读取终止判断所需的 LiDAR 距离。"""
+    lidar = env.scene[asset_cfg.name]
+    ray_starts_w = lidar.data.pos_w.unsqueeze(1)
+    distance = torch.linalg.norm(lidar.data.ray_hits_w - ray_starts_w, dim=-1)
+    distance = torch.nan_to_num(distance, nan=lidar_range, posinf=lidar_range, neginf=lidar_range)
+    return distance.clamp_max(lidar_range)
+
+
+def _obstacle_size(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """读取终止判断所需的动态障碍物尺寸。"""
+    collection_cfg = env.scene["dynamic_obstacles"].cfg
+    first_spawn = next(iter(collection_cfg.rigid_objects.values())).spawn
+    size = torch.tensor(first_spawn.size, device=env.device, dtype=torch.float32)
+    return size.unsqueeze(0).repeat(len(collection_cfg.rigid_objects), 1)
+
+
 def static_collision(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
     lidar_range: float = 4.0,
 ) -> torch.Tensor:
-    """静态障碍碰撞：LiDAR 任一光束读数接近量程上限。"""
-    lidar = _lidar_distance(env, asset_cfg, lidar_range)
-    return (lidar.amax(dim=(2, 3)) > lidar_range - 0.3).squeeze(-1)
+    """静态障碍碰撞：LiDAR 任一光束距离小于碰撞阈值。"""
+    distance = _lidar_distance(env, asset_cfg, lidar_range)
+    return distance.amin(dim=-1) < 0.3
 
 
 def dynamic_collision(
@@ -50,14 +66,14 @@ def dynamic_collision(
     drone_pos = env.scene["robot"].data.root_state_w[:, 0:3]
     manager = get_global_obstacle_manager(env)
     obstacle_pos_w = manager.position_w[0]
-    obstacle_size = _obstacle_size(env)
+    obstacle_dimensions = _obstacle_size(env)
 
     rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos.unsqueeze(1)
     distance_2d = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)
     distance_z = rel_pos_w[:, :, 2].abs()
 
-    obstacle_width = obstacle_size[:, 0:1]
-    obstacle_height = obstacle_size[:, 2:3]
+    obstacle_width = obstacle_dimensions[:, 0:1]
+    obstacle_height = obstacle_dimensions[:, 2:3]
     collision_2d = distance_2d <= obstacle_width.squeeze(-1) * 0.5 + margin
     collision_z = distance_z <= obstacle_height.squeeze(-1) * 0.5 + margin
     return (collision_2d & collision_z).any(dim=-1)

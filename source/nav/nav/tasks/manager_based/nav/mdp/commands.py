@@ -56,23 +56,16 @@ class NavTargetCommand(CommandTerm):
         if env_ids.numel() == 0:
             return
 
-        _, y_range, _ = self.cfg.map_range
-        y_bound = y_range + self.cfg.boundary_offset
         start_pos_w = self.robot.data.root_pos_w[env_ids]
         target_pos_w = start_pos_w.clone()
-        target_pos_w[:, 1] = self._env.scene.env_origins[env_ids, 1] - y_bound
+        # 目标边界是命令自身的参数，避免依赖 reset 事件的地图采样配置。
+        target_pos_w[:, 1] = self._env.scene.env_origins[env_ids, 1] + self.cfg.target_y
         target_dir_w = target_pos_w - start_pos_w
 
         self._command[env_ids, :3] = target_pos_w
         self._command[env_ids, 3:] = target_dir_w
         self._height_range[env_ids, 0] = start_pos_w[:, 2]
         self._height_range[env_ids, 1] = target_pos_w[:, 2]
-
-    def reset(self, env_ids=None):
-        """Reset and resample commands for selected environments."""
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
-        return super().reset(env_ids)
 
     def _update_metrics(self) -> None:
         self.metrics["distance"] = torch.linalg.vector_norm(self.target_dir_w, dim=-1)
@@ -83,12 +76,14 @@ class NavTargetCommand(CommandTerm):
 
 @configclass
 class NavTargetCommandCfg(CommandTermCfg):
-    """固定边界目标命令配置。"""
+    """固定边界目标命令配置。
+
+    ``target_y`` 使用每个环境原点为参考，属于目标命令自身的几何约束。
+    """
 
     class_type: type[CommandTerm] = NavTargetCommand
     asset_name: str = "robot"
-    map_range: tuple[float, float, float] = (20.0, 20.0, 6.0)
-    boundary_offset: float = 2.0
+    target_y: float = -22.0
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)
 
 __all__ = ["NavTargetCommand", "NavTargetCommandCfg", "get_nav_target_command"]

@@ -7,6 +7,7 @@ from isaaclab.assets import (
 )
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import RecorderManagerBaseCfg
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -119,9 +120,6 @@ class ActionsCfg:
     # 无人机三维世界系速度指令 [vx, vy, vz]（m/s）
     uav_velocity = mdp.UavVelocityActionCfg(asset_name="robot")
 
-    # 全局动态障碍物运动项：不消耗动作维度，在每个物理步前推进障碍物；
-    # 场景中没有障碍物集合时动作项自动禁用。
-    global_obstacle_motion: mdp.GlobalObstacleMotionActionCfg | None = mdp.GlobalObstacleMotionActionCfg()
 
 
 @configclass
@@ -159,6 +157,7 @@ class EventCfg:
             "map_range": (20.0, 20.0, 6.0),
             "start_z_range": (0.5, 2.5),
             "boundary_offset": 2.0,
+            "yaw_angle": -1.5707963267948966,
         },
     )
 
@@ -169,8 +168,7 @@ class CommandsCfg:
 
     nav_target = mdp.NavTargetCommandCfg(
         asset_name="robot",
-        map_range=(20.0, 20.0, 6.0),
-        boundary_offset=2.0,
+        target_y=-22.0,
         resampling_time_range=(1.0e9, 1.0e9),
     )
 
@@ -191,6 +189,26 @@ class TerminationsCfg:
     out_of_bounds = DoneTerm(func=mdp.out_of_bounds)
     success = DoneTerm(func=mdp.success)
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+
+
+@configclass
+class CurriculumCfg:
+    """课程训练项配置。
+
+    当前任务暂不启用主动课程项；保留该配置类是为了让环境结构与
+    IsaacLab 的 ManagerBasedRLEnv 完整配置保持一致。后续可在此添加
+    障碍物数量、运动速度或采样范围等难度调节项。
+    """
+
+    pass
+
+
+@configclass
+class RecorderCfg(RecorderManagerBaseCfg):
+    """训练过程与 episode 数据记录项配置。"""
+
+    # 默认关闭，避免普通 PPO 训练无意间创建数据集文件；需要数据集时显式启用。
+    reward_components: mdp.NavigationRewardRecorderCfg | None = None
 
 
 ##
@@ -215,13 +233,14 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
     # MDP 配置
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
+    curriculum: CurriculumCfg | None = CurriculumCfg()
+    recorders: RecorderCfg = RecorderCfg()
 
     # 后初始化
     def __post_init__(self) -> None:
         """完成环境配置的后初始化。"""
-        # 动态障碍物大开关：场景中没有刚体集合时，关闭动作、观测与终止相关项
+        # 动态障碍物大开关：场景中没有刚体集合时，关闭观测与终止相关项。
         if self.scene.dynamic_obstacles is None:
-            self.actions.global_obstacle_motion = None
             self.observations.policy.dynamic_obstacle = None
             self.terminations.dynamic_collision = None
         # 通用配置
