@@ -7,6 +7,7 @@ from isaaclab.assets import (
 )
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RecorderManagerBaseCfg
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -193,14 +194,19 @@ class TerminationsCfg:
 
 @configclass
 class CurriculumCfg:
-    """课程训练项配置。
+    """基于 episode 成功率推进的动态障碍物课程配置。"""
 
-    当前任务暂不启用主动课程项；保留该配置类是为了让环境结构与
-    IsaacLab 的 ManagerBasedRLEnv 完整配置保持一致。后续可在此添加
-    障碍物数量、运动速度或采样范围等难度调节项。
-    """
-
-    pass
+    dynamic_obstacles = CurrTerm(
+        func=mdp.SuccessRateDynamicObstacleCurriculum,
+        params={
+            "window_size": 1024,
+            "success_thresholds": (0.8, 0.7),
+            "transition_extent": (0.5, 0.5, 0.2),
+            "full_extent": (1.0, 1.0, 0.4),
+            "transition_speed": (0.125, 0.375),
+            "full_speed": (0.25, 0.75),
+        },
+    )
 
 
 @configclass

@@ -49,6 +49,9 @@ class GlobalObstacleMotionCfg:
     arrival_threshold: float = 0.05
     """判定到达航点并重新采样的距离阈值，单位为 m。"""
 
+    enabled: bool = True
+    """是否启用运动；课程训练可以在前期将其设为 False。"""
+
 
 ##
 # 运动引擎
@@ -141,6 +144,14 @@ class GlobalObstacleManager:
         if not self._initialized:
             self.initialize()
 
+        if not self.cfg.enabled:
+            # 静态课程阶段仍写入当前位姿和零速度，保持资产状态有效。
+            self._linear_velocity_w.zero_()
+            self._velocity_w.zero_()
+            self.asset.write_object_link_pose_to_sim(self._pose_w)
+            self.asset.write_object_link_velocity_to_sim(self._velocity_w)
+            return
+
         # 为物理步开始时已经到达目标的障碍物重新采样航点。
         delta = self._target_pos_w - self._position_w
         distance = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
@@ -163,6 +174,27 @@ class GlobalObstacleManager:
         # 速度进 PhysX 后，无人机与障碍物接触时碰撞响应使用真实相对速度。
         self.asset.write_object_link_pose_to_sim(self._pose_w)
         self.asset.write_object_link_velocity_to_sim(self._velocity_w)
+
+    def set_difficulty(
+        self,
+        enabled: bool,
+        motion_half_extent: tuple[float, float, float],
+        speed_range: tuple[float, float],
+    ) -> None:
+        """更新课程难度；参数由课程项传入，状态仍由资产管理器保存。"""
+        if len(motion_half_extent) != 3 or any(value < 0.0 for value in motion_half_extent):
+            raise ValueError("motion_half_extent must contain three non-negative values.")
+        min_speed, max_speed = speed_range
+        if min_speed <= 0.0 or max_speed < min_speed:
+            raise ValueError("speed_range must satisfy 0 < min_speed <= max_speed.")
+
+        self.cfg.enabled = enabled
+        self.cfg.motion_half_extent = motion_half_extent
+        self.cfg.speed_range = speed_range
+        self._motion_half_extent.copy_(
+            torch.tensor(motion_half_extent, dtype=self._motion_half_extent.dtype, device=self.asset.device)
+            .view(1, 1, 3)
+        )
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:

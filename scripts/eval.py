@@ -11,6 +11,7 @@ import argparse
 import csv
 import datetime
 import json
+import random
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +35,10 @@ parser.add_argument("--disable_fabric", action="store_true", default=False)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
+# 动态障碍物高度在任务配置导入时由 Python random 生成，必须在导入
+# nav.tasks 之前固定种子，才能让相同 --seed 对应相同的评估场景。
+random.seed(args_cli.seed)
+
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -44,6 +49,7 @@ import torch  # noqa: E402
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: E402
 
 import nav.tasks  # noqa: F401, E402
+from nav.assets.dynamic import get_global_obstacle_manager, has_scene_entity  # noqa: E402
 from nav.tasks.manager_based.nav.agents.common import obs_to_tensordict  # noqa: E402
 from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
 
@@ -199,6 +205,8 @@ def summarize(records, checkpoint, task, seed, episodes_per_env, num_envs, step_
         "episode_count": episode_count,
         "step_dt": step_dt,
         "action_mode": "stochastic" if stochastic else "deterministic_mean",
+        "evaluation_difficulty": "full_dynamic",
+        "curriculum_enabled": False,
         "success_count": counts["success"],
         "success_rate": rate(counts["success"]),
         "static_collision_count": counts["static_collision"],
@@ -423,10 +431,17 @@ def main():
         use_fabric=not args_cli.disable_fabric,
     )
     env_cfg.seed = args_cli.seed
+    # 评估固定在课程最终难度，不统计成功率，也不在测试过程中切换阶段。
+    # 禁用课程后，动态障碍物使用资产模块的默认完整运动范围和速度。
+    env_cfg.curriculum = None
     torch.manual_seed(args_cli.seed)
 
     agent_cfg = load_agent_cfg(args_cli.task, args_cli.agent)
     env = gym.make(args_cli.task, cfg=env_cfg)
+    # 课程已关闭时不会再通过 CurriculumManager 懒创建动态障碍物管理器；
+    # 这里显式初始化，确保评估使用最终的完整动态场景。
+    if has_scene_entity(env.unwrapped, "dynamic_obstacles"):
+        get_global_obstacle_manager(env.unwrapped)
     agent = make_agent(agent_cfg, env)
     agent.load(checkpoint)
 
