@@ -112,35 +112,36 @@ class NavigationReward(ManagerTermBase):
         penalty_dynamic = torch.zeros(env.num_envs, 1, device=env.device)
         if has_scene_entity(env, "dynamic_obstacles"):
             manager = get_global_obstacle_manager(env)
-            obstacle_pos_w = manager.position_w[0]
-            obstacle_dimensions = _obstacle_size(env)
-            num_obstacles = obstacle_pos_w.shape[0]
-            num_observed = min(5, num_obstacles)
-            if num_observed > 0:
-                rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos_w.unsqueeze(1)
-                distance_2d_all = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)
-                nearest_ids = torch.topk(distance_2d_all, k=num_observed, largest=False).indices
-                range_mask = torch.gather(distance_2d_all, 1, nearest_ids) > lidar_range
+            if manager.enabled:
+                obstacle_pos_w = manager.active_position_w[0]
+                obstacle_dimensions = _obstacle_size(env).index_select(0, manager.active_indices)
+                num_obstacles = obstacle_pos_w.shape[0]
+                num_observed = min(5, num_obstacles)
+                if num_observed > 0:
+                    rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos_w.unsqueeze(1)
+                    distance_2d_all = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)
+                    nearest_ids = torch.topk(distance_2d_all, k=num_observed, largest=False).indices
+                    range_mask = torch.gather(distance_2d_all, 1, nearest_ids) > lidar_range
 
-                gather_ids = nearest_ids.unsqueeze(-1).expand(-1, -1, 3)
-                rel_pos_w = torch.gather(rel_pos_w, 1, gather_ids)
-                obstacle_dimensions = obstacle_dimensions.unsqueeze(0).expand(env.num_envs, -1, -1)
-                obstacle_dimensions = torch.gather(obstacle_dimensions, 1, gather_ids)
-                obstacle_width = obstacle_dimensions[:, :, 0:1]
-                obstacle_height = obstacle_dimensions[:, :, 2:3]
+                    gather_ids = nearest_ids.unsqueeze(-1).expand(-1, -1, 3)
+                    rel_pos_w = torch.gather(rel_pos_w, 1, gather_ids)
+                    obstacle_dimensions = obstacle_dimensions.unsqueeze(0).expand(env.num_envs, -1, -1)
+                    obstacle_dimensions = torch.gather(obstacle_dimensions, 1, gather_ids)
+                    obstacle_width = obstacle_dimensions[:, :, 0:1]
+                    obstacle_height = obstacle_dimensions[:, :, 2:3]
 
-                distance_2d = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1, keepdim=True)
-                distance_z = rel_pos_w[:, :, 2:3].abs()
-                distance_2d[range_mask] = float("inf")
-                distance_z[range_mask] = float("inf")
-                collision_2d = distance_2d <= obstacle_width * 0.5 + 0.3
-                collision_z = distance_z <= obstacle_height * 0.5 + 0.3
-                dynamic_collision = (collision_2d & collision_z).any(dim=1)
+                    distance_2d = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1, keepdim=True)
+                    distance_z = rel_pos_w[:, :, 2:3].abs()
+                    distance_2d[range_mask] = float("inf")
+                    distance_z[range_mask] = float("inf")
+                    collision_2d = distance_2d <= obstacle_width * 0.5 + 0.3
+                    collision_z = distance_z <= obstacle_height * 0.5 + 0.3
+                    dynamic_collision = (collision_2d & collision_z).any(dim=1)
 
-                dynamic_clearance = torch.linalg.norm(rel_pos_w, dim=-1) - obstacle_width.squeeze(-1) * 0.5
-                dynamic_clearance[range_mask] = lidar_range
-                dynamic_clearance = dynamic_clearance.clamp(min=0.0, max=lidar_range)
-                penalty_dynamic = torch.relu(dynamic_safe_distance - dynamic_clearance).pow(2).mean(dim=-1, keepdim=True)
+                    dynamic_clearance = torch.linalg.norm(rel_pos_w, dim=-1) - obstacle_width.squeeze(-1) * 0.5
+                    dynamic_clearance[range_mask] = lidar_range
+                    dynamic_clearance = dynamic_clearance.clamp(min=0.0, max=lidar_range)
+                    penalty_dynamic = torch.relu(dynamic_safe_distance - dynamic_clearance).pow(2).mean(dim=-1, keepdim=True)
 
         # 高度范围
         height_range = env.command_manager.get_term("nav_target").height_range

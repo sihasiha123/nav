@@ -122,14 +122,6 @@ figure/<run_name>_iteration_return.png
 
 ## 评估
 
-先进行小规模评估：
-
-```bash
-
-```
-
-正式评估：
-
 ```bash
 python scripts/eval.py \
   --checkpoint runs/ppo_20260827_230100/checkpoint_final.pt \

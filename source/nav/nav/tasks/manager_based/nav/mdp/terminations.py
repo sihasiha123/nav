@@ -65,8 +65,10 @@ def dynamic_collision(
 
     drone_pos = env.scene["robot"].data.root_state_w[:, 0:3]
     manager = get_global_obstacle_manager(env)
-    obstacle_pos_w = manager.position_w[0]
-    obstacle_dimensions = _obstacle_size(env)
+    if not manager.enabled:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    obstacle_pos_w = manager.active_position_w[0]
+    obstacle_dimensions = _obstacle_size(env).index_select(0, manager.active_indices)
 
     rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos.unsqueeze(1)
     distance_2d = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)

@@ -52,6 +52,9 @@ class GlobalObstacleMotionCfg:
     enabled: bool = True
     """是否启用运动；课程训练可以在前期将其设为 False。"""
 
+    active_count: int | None = None
+    """参与当前任务的障碍物数量；``None`` 表示启用集合中的全部对象。"""
+
 
 ##
 # 运动引擎
@@ -98,6 +101,10 @@ class GlobalObstacleManager:
         self._velocity_w: torch.Tensor
         self._speed: torch.Tensor
         self._pose_w: torch.Tensor
+        self._activation_order: torch.Tensor
+        self._active_mask: torch.Tensor
+        self._active_indices: torch.Tensor
+        self._active_count = self.asset.num_objects if self.cfg.active_count is None else self.cfg.active_count
 
     @property
     def physics_dt(self) -> float:
@@ -129,13 +136,17 @@ class GlobalObstacleManager:
             device=self._position_w.device,
         )
 
-        all_objects = torch.ones(
-            self._position_w.shape[:-1],
-            dtype=torch.bool,
-            device=self._position_w.device,
+        # 使用与对象数量互质的步长生成交错顺序，使少量激活对象也分散在整张地图。
+        step = self._coprime_step(self.asset.num_objects)
+        self._activation_order = (
+            torch.arange(self.asset.num_objects, device=self.asset.device, dtype=torch.long) * step
+        ) % self.asset.num_objects
+        self._active_mask = torch.zeros(
+            self._position_w.shape[:-1], dtype=torch.bool, device=self._position_w.device
         )
-        self._sample_waypoints(all_objects)
+        self._active_indices = torch.empty(0, dtype=torch.long, device=self.asset.device)
         self._initialized = True
+        self._apply_active_count(self._active_count)
 
     def step(self, dt: float) -> None:
         """推进一个物理步，并批量写入所有障碍物的位姿和速度。"""
@@ -144,18 +155,13 @@ class GlobalObstacleManager:
         if not self._initialized:
             self.initialize()
 
-        if not self.cfg.enabled:
-            # 静态课程阶段仍写入当前位姿和零速度，保持资产状态有效。
-            self._linear_velocity_w.zero_()
-            self._velocity_w.zero_()
-            self.asset.write_object_link_pose_to_sim(self._pose_w)
-            self.asset.write_object_link_velocity_to_sim(self._velocity_w)
+        if not self.enabled:
             return
 
         # 为物理步开始时已经到达目标的障碍物重新采样航点。
         delta = self._target_pos_w - self._position_w
         distance = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
-        arrived = distance[..., 0] <= self.cfg.arrival_threshold
+        arrived = (distance[..., 0] <= self.cfg.arrival_threshold) & self._active_mask
         self._sample_waypoints(arrived)
 
         # 重新计算目标方向，并执行一次不会越过航点的直线积分。
@@ -163,7 +169,7 @@ class GlobalObstacleManager:
         distance = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
         direction = delta / distance.clamp_min(1.0e-6)
         travel = torch.minimum(self._speed * dt, distance)
-        displacement = direction * travel
+        displacement = direction * travel * self._active_mask.unsqueeze(-1)
 
         self._position_w.add_(displacement)
         self._linear_velocity_w.copy_(displacement / dt)
@@ -180,6 +186,7 @@ class GlobalObstacleManager:
         enabled: bool,
         motion_half_extent: tuple[float, float, float],
         speed_range: tuple[float, float],
+        active_count: int | None = None,
     ) -> None:
         """更新课程难度；参数由课程项传入，状态仍由资产管理器保存。"""
         if len(motion_half_extent) != 3 or any(value < 0.0 for value in motion_half_extent):
@@ -187,14 +194,46 @@ class GlobalObstacleManager:
         min_speed, max_speed = speed_range
         if min_speed <= 0.0 or max_speed < min_speed:
             raise ValueError("speed_range must satisfy 0 < min_speed <= max_speed.")
+        if active_count is None:
+            active_count = self.asset.num_objects if enabled else 0
+        if not 0 <= active_count <= self.asset.num_objects:
+            raise ValueError(
+                f"active_count must be in [0, {self.asset.num_objects}], received {active_count}."
+            )
 
+        difficulty_changed = (
+            self.cfg.motion_half_extent != motion_half_extent or self.cfg.speed_range != speed_range
+        )
         self.cfg.enabled = enabled
+        self.cfg.active_count = active_count
         self.cfg.motion_half_extent = motion_half_extent
         self.cfg.speed_range = speed_range
         self._motion_half_extent.copy_(
             torch.tensor(motion_half_extent, dtype=self._motion_half_extent.dtype, device=self.asset.device)
             .view(1, 1, 3)
         )
+
+        self._active_count = active_count
+        if self._initialized:
+            self._apply_active_count(active_count)
+            if enabled and difficulty_changed:
+                self._sample_waypoints(self._active_mask)
+
+    @property
+    def enabled(self) -> bool:
+        """当前课程阶段是否启用动态障碍物。"""
+        return bool(self.cfg.enabled and self._active_count > 0)
+
+    @property
+    def active_count(self) -> int:
+        """当前参与观测、奖励和碰撞判断的障碍物数量。"""
+        return int(self._active_count)
+
+    @property
+    def active_indices(self) -> torch.Tensor:
+        """当前激活对象在刚体集合中的索引。"""
+        self._ensure_initialized()
+        return self._active_indices
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
@@ -209,6 +248,12 @@ class GlobalObstacleManager:
         return self._position_w
 
     @property
+    def active_position_w(self) -> torch.Tensor:
+        """当前激活动态障碍物的位置，形状为 ``[1, active_count, 3]``。"""
+        self._ensure_initialized()
+        return self._position_w.index_select(1, self._active_indices)
+
+    @property
     def target_pos_w(self) -> torch.Tensor:
         """当前局部航点，形状为 ``[1, num_objects, 3]``。"""
         self._ensure_initialized()
@@ -219,6 +264,56 @@ class GlobalObstacleManager:
         """实际脚本线速度，形状为 ``[1, num_objects, 3]``。"""
         self._ensure_initialized()
         return self._linear_velocity_w
+
+    @property
+    def active_linear_velocity_w(self) -> torch.Tensor:
+        """当前激活动态障碍物的线速度。"""
+        self._ensure_initialized()
+        return self._linear_velocity_w.index_select(1, self._active_indices)
+
+    def _apply_active_count(self, active_count: int) -> None:
+        """放回新增对象并停放未激活对象，不改变 PhysX 集合的固定形状。"""
+        old_mask = self._active_mask.clone()
+        new_mask = torch.zeros_like(self._active_mask)
+        active_indices = self._activation_order[:active_count]
+        new_mask[:, active_indices] = True
+        newly_active = new_mask & ~old_mask
+        newly_inactive = old_mask & ~new_mask
+
+        if newly_active.any():
+            selection = newly_active.unsqueeze(-1)
+            self._position_w.copy_(torch.where(selection, self._anchor_pos_w, self._position_w))
+            self._pose_w[..., :3].copy_(self._position_w)
+            self._linear_velocity_w[newly_active] = 0.0
+            self._velocity_w[newly_active] = 0.0
+
+        if (~new_mask).any():
+            parked_position = self._anchor_pos_w.clone()
+            parked_position[..., 0] += 1000.0
+            selection = (~new_mask).unsqueeze(-1)
+            self._position_w.copy_(torch.where(selection, parked_position, self._position_w))
+            self._target_pos_w.copy_(torch.where(selection, parked_position, self._target_pos_w))
+            self._pose_w[..., :3].copy_(self._position_w)
+            self._linear_velocity_w[~new_mask] = 0.0
+            self._velocity_w[~new_mask] = 0.0
+
+        self._active_mask.copy_(new_mask)
+        self._active_indices = active_indices.clone()
+        if newly_active.any():
+            self._sample_waypoints(newly_active)
+        if newly_active.any() or newly_inactive.any():
+            self.asset.write_object_link_pose_to_sim(self._pose_w)
+            self.asset.write_object_link_velocity_to_sim(self._velocity_w)
+
+    @staticmethod
+    def _coprime_step(num_objects: int) -> int:
+        """返回一个与对象数量互质的大步长，用于生成空间交错激活顺序。"""
+        if num_objects <= 1:
+            return 1
+        candidate = max(1, int(num_objects * 0.37))
+        while math.gcd(candidate, num_objects) != 1:
+            candidate += 1
+        return candidate
 
     def _sample_waypoints(self, object_mask: torch.Tensor) -> None:
         """为 ``object_mask`` 选中的障碍物采样新目标和速度。"""

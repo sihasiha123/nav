@@ -139,9 +139,11 @@ def dynamic_obstacle_obs(
         return dynamic_obstacle
 
     manager = get_global_obstacle_manager(env)
-    obstacle_pos_w = manager.position_w[0]
-    obstacle_vel_w = manager.linear_velocity_w[0]
-    obstacle_dimensions = _obstacle_size(env)
+    if not manager.enabled:
+        return dynamic_obstacle
+    obstacle_pos_w = manager.active_position_w[0]
+    obstacle_vel_w = manager.active_linear_velocity_w[0]
+    obstacle_dimensions = _obstacle_size(env).index_select(0, manager.active_indices)
     num_obstacles = obstacle_pos_w.shape[0]
     num_observed = min(num_observed, num_obstacles)
 

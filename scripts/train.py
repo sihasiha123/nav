@@ -181,6 +181,26 @@ class RolloutRewardComponentStatistics:
         return metrics
 
 
+class RolloutCurriculumStatistics:
+    """保留官方 CurriculumManager 在 reset 时写入的最新状态。"""
+
+    def __init__(self):
+        self._latest = {}
+
+    def update(self, extras):
+        if not isinstance(extras, dict):
+            return
+        log_data = extras.get("log", {})
+        if not isinstance(log_data, dict):
+            return
+        for key, value in log_data.items():
+            if key.startswith("Curriculum/"):
+                self._latest[key] = to_float(value)
+
+    def metrics(self):
+        return dict(self._latest)
+
+
 def collect_algo_log_items(train_info, rollout):
     return {
         "Rollout_Reward/step_mean": to_float(rollout["next", "agents", "reward"]),
@@ -211,6 +231,16 @@ def collect_terminal_log_items(env_log, algo_log):
     for display_name, source_name in result_keys.items():
         if source_name in env_log:
             log_items[f"result/{display_name}"] = env_log[source_name]
+
+    curriculum_keys = {
+        "stage": "Curriculum/dynamic_obstacles/stage",
+        "success_rate": "Curriculum/dynamic_obstacles/window_success_rate",
+        "passes": "Curriculum/dynamic_obstacles/consecutive_passes",
+        "active_obstacles": "Curriculum/dynamic_obstacles/active_obstacles",
+    }
+    for display_name, source_name in curriculum_keys.items():
+        if source_name in env_log:
+            log_items[f"curriculum/{display_name}"] = env_log[source_name]
 
     reward_component_keys = {
         "progress": "Reward_Component/progress_mean",
@@ -303,12 +333,13 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
     frames = []
     env_statistics = RolloutEnvStatistics(env.unwrapped)
     reward_component_statistics = RolloutRewardComponentStatistics(env.unwrapped)
+    curriculum_statistics = RolloutCurriculumStatistics()
 
     for _ in range(cfg.training_frame_num):
         action_td = agent.act(obs_td.clone())
 
         # nav 环境只接收动作 tensor（不是 TensorDict）
-        next_obs, reward, terminated, truncated, _ = env.step(action_td["agents", "action"])
+        next_obs, reward, terminated, truncated, extras = env.step(action_td["agents", "action"])
         next_obs_td = obs_to_tensordict(next_obs, env.unwrapped.num_envs, env.unwrapped.device)
 
         reward = reward.reshape(env.unwrapped.num_envs, 1)
@@ -318,6 +349,7 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
         completed_returns = return_tracker.update(reward, done)
         env_statistics.update(done, completed_returns)
         reward_component_statistics.update()
+        curriculum_statistics.update(extras)
 
         next_observation = next_obs_td["agents", "observation"].detach().clone()
         current_observation = action_td["agents", "observation"].detach().clone()
@@ -365,6 +397,7 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
     rollout = torch.stack(frames, dim=1)
     env_log = env_statistics.metrics()
     env_log.update(reward_component_statistics.metrics())
+    env_log.update(curriculum_statistics.metrics())
     return rollout, obs_td, env_log
 
 

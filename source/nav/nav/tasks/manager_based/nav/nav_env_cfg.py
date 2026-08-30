@@ -194,17 +194,29 @@ class TerminationsCfg:
 
 @configclass
 class CurriculumCfg:
-    """基于 episode 成功率推进的动态障碍物课程配置。"""
+    """基于 episode 成功率逐步增加动态障碍物数量、速度和运动范围。"""
 
     dynamic_obstacles = CurrTerm(
         func=mdp.SuccessRateDynamicObstacleCurriculum,
         params={
             "window_size": 1024,
-            "success_thresholds": (0.8, 0.7),
-            "transition_extent": (0.5, 0.5, 0.2),
-            "full_extent": (1.0, 1.0, 0.4),
-            "transition_speed": (0.125, 0.375),
-            "full_speed": (0.25, 0.75),
+            "success_thresholds": (0.85, 0.65, 0.68, 0.70),
+            "active_counts": (0, 20, 50, 75, 100),
+            "motion_extents": (
+                (0.0, 0.0, 0.0),
+                (0.15, 0.15, 0.05),
+                (0.35, 0.35, 0.15),
+                (0.65, 0.65, 0.25),
+                (1.0, 1.0, 0.4),
+            ),
+            "speed_ranges": (
+                (0.05, 0.10),
+                (0.05, 0.15),
+                (0.10, 0.30),
+                (0.15, 0.50),
+                (0.25, 0.75),
+            ),
+            "required_passes": 2,
         },
     )
 
