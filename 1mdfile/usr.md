@@ -122,17 +122,27 @@ figure/<run_name>_iteration_return.png
 
 ## 评估
 
-先进行小规模评估：
+### 快速检查
 
-```bash
-
-```
-
-正式评估：
+先用少量环境确认 checkpoint 可以正常加载和运行：
 
 ```bash
 python scripts/eval.py \
-  --checkpoint runs/ppo_20260827_230100/checkpoint_final.pt \
+  --checkpoint runs/ppo_20260903_215338/checkpoint_1100.pt \
+  --task Template-Nav-v0 \
+  --num_envs 16 \
+  --episodes_per_env 1 \
+  --seed 0 \
+  --headless
+```
+
+### 标准评估
+
+固定使用 `1024` 个环境、每个环境完成 `1` 个 episode，适合比较不同 checkpoint：
+
+```bash
+python scripts/eval.py \
+  --checkpoint runs/ppo_20260903_223324/checkpoint_final.pt \
   --task Template-Nav-v0 \
   --num_envs 1024 \
   --episodes_per_env 1 \
@@ -140,19 +150,66 @@ python scripts/eval.py \
   --headless
 ```
 
-多 episode 评估并指定目录：
+默认使用策略分布的确定性均值动作。比较不同模型时，应保持 `task`、`num_envs`、
+`episodes_per_env`、`seed` 和动作模式完全一致。
+
+### 多轮评估
+
+每个并行环境运行 `5` 个 episode，并指定输出目录：
 
 ```bash
 python scripts/eval.py \
-  --checkpoint runs/ppo_20260827_230100/checkpoint_final.pt \
+  --checkpoint runs/ppo_20260903_215338/checkpoint_1100.pt \
+  --task Template-Nav-v0 \
   --num_envs 1024 \
   --episodes_per_env 5 \
   --seed 0 \
   --headless \
-  --output_dir output/ppo_20260819_222322_checkpoint_2000
+  --output_dir output/ppo_20260903_215338_checkpoint_1100
 ```
 
-不传 `--output_dir` 时，结果写入：
+这会产生 `1024 × 5 = 5120` 条 episode 记录，因此耗时明显高于标准评估。
+
+### 随机动作采样评估
+
+增加 `--stochastic` 后，从策略分布中采样动作：
+
+```bash
+python scripts/eval.py \
+  --checkpoint runs/ppo_20260903_215338/checkpoint_1100.pt \
+  --task Template-Nav-v0 \
+  --num_envs 1024 \
+  --episodes_per_env 1 \
+  --seed 0 \
+  --stochastic \
+  --headless
+```
+
+正式报告优先使用默认的确定性评估；随机评估用于观察策略分布的探索行为。
+
+### 参数说明
+
+```text
+--checkpoint          必填，待评估的 checkpoint 文件
+--task                环境任务名，默认 Template-Nav-v0
+--agent               算法配置入口，默认 ppo_cfg_entry_point
+--num_envs            并行环境数；快速检查用 16，正式评估用 1024
+--episodes_per_env     每个环境需要完成的 episode 数，默认 1
+--seed                 场景和随机动作种子，默认 0
+--stochastic           使用随机采样动作；不传时使用确定性均值动作
+--output_dir           自定义结果目录
+--headless             无图形界面运行
+--disable_fabric       禁用 Fabric，一般不需要设置
+```
+
+### 运行过程
+
+`[INFO]: Completed setting up the environment...` 表示环境已经创建完成，随后才开始
+执行评估。脚本需要等待所有并行环境完成指定数量的 episode，才会统一打印汇总并写入
+结果文件。单个 episode 最长为 `60` 秒仿真时间，即 `3600` step；如果少数环境直到
+超时才结束，终端可能较长时间没有新输出，这不代表仍在创建环境。
+
+不传 `--output_dir` 时，结果默认写入：
 
 ```text
 output/eval_<时间>/
@@ -163,10 +220,12 @@ output/eval_<时间>/
 ```text
 episodes.csv    每个完成 episode 的回报、步数、时间、终止原因
 summary.json    成功、碰撞、越界、超时和回报汇总
+report.html     可直接浏览的评估报告
 ```
 
-评估默认使用确定性均值动作。需要随机采样时增加：
+查看最近一次评估结果：
 
-```text
---stochastic
+```bash
+ls -lt output | head
+cat output/eval_<时间>/summary.json
 ```

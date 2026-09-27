@@ -1,158 +1,117 @@
-# manager
+# NavigationReward 旧版备份
 
-# InteractiveScene
+本文档备份修改前的 `mdp.NavigationReward` 奖励函数，作为当前奖励修改前的恢复依据。旧版实现文件为：
 
-InteractiveScene是 Isaac Lab 对“仿真场景中所有实体”的统一容器，不是 RL Manager
-
-# 数据流转
-
-环境配置 cfg
-↓
-InteractiveScene 创建场景实体
-↓
-各 Manager 注册 MDP term
-↓
-env.reset()
-↓
-返回 observation
-↓
-Policy 输出 action
-↓
-env.step(action)
-↓
-返回 observation、reward、done、extras
-
-
-### 第二步：先确定任务定义
-
-先把任务规则写清楚，不写代码：
-
-```
-机器人起点：+Y 边界
-目标位置：-Y 边界
-起点 X：按环境编号分布
-起点 Z：指定范围随机
-机器人初始速度：0
-目标是否重采样：每个 episode 一次
+```text
+source/nav/nav/tasks/manager_based/nav/mdp/rewards.py
 ```
 
-如果当前任务就是单侧到单侧，就不要保留四边随机、起点方向、目标方向等暂时不用的参数。
+## 旧版计算流程
 
-### 第三步：统一配置来源
+每个环境、每个 step 计算：
 
-建立一个简单的任务几何配置：
-
-```
-@configclass
-class NavTaskCfg:
-    map_size = (20.0, 20.0, 6.0)
-    boundary_offset = 2.0
-    start_z_range = (0.5, 2.5)
-```
-
-`Event` 和 `Command` 都读取这个配置，不再各自声明 `map_range` 和 `boundary_offset`。
-
-### 第四步：先重写 reset
-
-`events.py` 只做一件事：
-
-```
-reset_robot_state
-    设置机器人位置
-    设置机器人姿态
-    设置机器人速度
-    设置关节状态
+```text
+目标距离进展
+目标方向速度
+静态 LiDAR 风险
+动态障碍物风险
+高度偏离
+速度平滑
+时间代价
+安全到达奖励
+碰撞惩罚
+越界惩罚
 ```
 
-不要在这里：
+旧版公式为：
 
-```
-生成目标
-初始化奖励历史
-保存任务 buffer
-记录奖励分项
-```
-
-### 第五步：再重写 Command
-
-`commands.py` 只负责：
-
-```
-根据当前机器人位置生成目标位置
-保存 target_position
-可选保存 target_velocity
+```text
+progress          = 4.0 × (previous_distance - distance)
+goal_velocity     = 0.5 × clamp(dot(drone_velocity, target_direction), -2, 2)
+static_avoidance  = -6.0 × relu(1.2 - static_clearance)^2
+dynamic_avoidance = -10.0 × relu(1.5 - dynamic_clearance)^2
+height            = -2.0 × height_violation^2
+smoothness        = -0.05 × ||velocity - previous_velocity||
+time              = -0.01
+goal_first        = +120.0  （首次安全到达目标）
+goal_reached      = +0.5    （安全处于目标半径内）
+collision         = -120.0  （静态或动态碰撞）
+out_of_bounds     = -120.0  （飞行高度超出范围）
 ```
 
-观测、奖励和终止条件统一通过：
+总奖励：
 
-```
-env.command_manager.get_command("nav_target")
-```
-
-获取目标。
-
-### 第六步：逐个实现 MDP 类
-
-建议顺序：
-
-```
-SceneCfg
-→ NavEnvCfg
-→ reset_robot_state
-→ NavTargetCommand
-→ UavVelocityAction
-→ observations
-→ terminations
-→ rewards
-→ recorders
+```text
+reward = progress
+       + goal_velocity
+       + static_avoidance
+       + dynamic_avoidance
+       + height
+       + smoothness
+       + time
+       + goal_first
+       + goal_reached
+       + collision
+       + out_of_bounds
 ```
 
-每完成一个类，都先测试构造和 reset，不要等全部写完再调试。
+## 旧版参数
 
-### 第七步：删除旧逻辑
-
-确认新流程工作后，再删除：
-
-```
-NavTaskBuffer
-env._nav_task_buffer
-env._nav_reward_term
-重复的 map_range 参数
-重复的 target_dir 保存
-Event 中的目标生成逻辑
+```text
+lidar_range              4.0 m
+static_safe_distance     1.2 m
+dynamic_safe_distance    1.5 m
+goal_radius              0.5 m
+z_min                    0.2 m
+z_max                    4.0 m
+out_of_bounds_penalty    120.0
 ```
 
-### 第八步：最后接入动态障碍物和训练
+动态碰撞使用最近的 5 个障碍物计算风险，但终止判断检查全部动态障碍物。奖励 Term 自身保存以下跨 step 状态：
 
-动态障碍物先作为独立资产验证：
-
-```
-创建场景
-→ 障碍物初始化
-→ 推进一步
-→ 检查位置变化
-```
-
-确认资产运行正常后，再接入环境 step。最后才恢复 PPO trainer。
-
-### 重构的最小目标
-
-先做到这个结构：
-
-```
-Event       设置机器人初始状态
-Command     生成目标
-Action      执行动作
-Observation 读取状态和目标
-Reward      计算奖励
-Termination 判断结束
-Scene       保存仿真资产状态
-Env         负责装配和生命周期
-Trainer     收集 rollout
-Algo        更新网络
+```text
+prev_distance
+prev_drone_vel_w
+reached_goal_once
+_initialized
+reward_components
 ```
 
-核心原则是：
+## 旧版缩放问题
 
-> 先把单一任务、单一目标、单一 reset 流程跑通，再逐步增加动态障碍物、随机化和复杂奖励。不要一开始就保留所有旧参数和兼容逻辑。
->
+Isaac Lab `RewardManager` 会执行：
+
+```python
+value = reward_term(...) * weight * dt
+```
+
+当前 `dt=1/60`，因此旧版终止项实际进入环境 Return 的单步值约为：
+
+```text
+goal_first       +120 × 1/60 = +2
+collision        -120 × 1/60 = -2
+out_of_bounds    -120 × 1/60 = -2
+```
+
+这会导致无人机在碰撞前积累较多进展和速度奖励，即使最后碰撞，episode Return 仍可能为正。该问题由当前 `NavigationReward` 的终止奖励调整重点修正。
+
+## 旧版记录的分项
+
+旧版通过 `reward_components` 暴露以下分项，记录值已经乘以 `step_dt`，与 `env.step()` 返回的奖励尺度一致：
+
+```text
+progress
+goal_velocity
+static_avoidance
+dynamic_avoidance
+height
+smoothness
+time
+goal_first
+goal_reached
+collision
+out_of_bounds
+total
+```
+
+当前版本保持旧版分项名称，并额外记录 `time_out`，便于区分碰撞、越界和纯超时失败。
