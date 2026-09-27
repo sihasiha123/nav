@@ -87,7 +87,7 @@ find runs -name 'checkpoint*.pt' | sort
 
 ```bash
 python scripts/plot_return.py \
-  runs/ppo_20260819_222322
+  runs/ppo_20260927_214540
 ```
 
 默认使用 50 个 iteration 的移动平均。关闭平滑或修改窗口：
@@ -124,7 +124,7 @@ figure/<run_name>_iteration_return.png
 
 ```bash
 python scripts/eval.py \
-  --checkpoint runs/ppo_20260827_230100/checkpoint_final.pt \
+  --checkpoint runs/ppo_20260927_214540/checkpoint_final.pt \
   --task Template-Nav-v0 \
   --num_envs 1024 \
   --episodes_per_env 1 \

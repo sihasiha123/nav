@@ -44,9 +44,9 @@ class SuccessRateDynamicObstacleCurriculum(ManagerTermBase):
         env_ids: Sequence[int],
         window_size: int = 1024,
         success_thresholds: tuple[float, ...] = (0.85, 0.65, 0.68, 0.70),
-        active_counts: tuple[int, ...] = (0, 20, 50, 75, 100),
+        active_counts: tuple[int, ...] = (5, 20, 50, 75, 100),
         motion_extents: tuple[tuple[float, float, float], ...] = (
-            (0.0, 0.0, 0.0),
+            (0.05, 0.05, 0.02),
             (0.15, 0.15, 0.05),
             (0.35, 0.35, 0.15),
             (0.65, 0.65, 0.25),
