@@ -3,15 +3,17 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""自定义 PPO：Beta 动作分布、lidar CNN + dynamic MLP 特征提取、ValueNorm。"""
+"""自定义 PPO：状态/目标 MLP、深度 CNN、机体系 Beta 速度动作与 ValueNorm。"""
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import ValueNorm, vec_to_world
+from .common import ValueNorm
 
 __all__ = [
     "PPO",
@@ -24,47 +26,53 @@ __all__ = [
 
 
 class PPOFeatureExtractor(nn.Module):
-    """lidar CNN + dynamic obstacle MLP + state 拼接融合。"""
+    """三个观测分支融合为 (B, 256)，由 Actor 和 Critic 共享。
+
+    state: (B, 9)，goal: (B, 4)，depth: (B, 1, H, W)。
+    深度已由环境归一化为 [0, 1]，此处不再缩放。
+    """
 
     def __init__(self):
         super().__init__()
 
-        self.lidar_encoder = nn.Sequential(
-            nn.LazyConv2d(out_channels=4, kernel_size=(5, 3), padding=(2, 1)),
+        self.state_encoder = nn.Sequential(
+            nn.Linear(9, 64),
             nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=(5, 3), stride=(2, 1), padding=(2, 1)),
+            nn.Linear(64, 64),
             nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=(5, 3), stride=(2, 2), padding=(2, 1)),
+        )
+        self.goal_encoder = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.ELU(),
+            nn.Linear(32, 32),
+            nn.ELU(),
+        )
+
+        # 当前 54x96 图像依次变为 27x48、14x24、7x12。
+        self.depth_encoder = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),
+            nn.ELU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ELU(),
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),
             nn.ELU(),
             nn.Flatten(),
             nn.LazyLinear(128),
             nn.LayerNorm(128),
         )
 
-        self.dynamic_encoder = nn.Sequential(
-            nn.Flatten(),
-            nn.LazyLinear(128),
-            nn.ELU(),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-        )
-
         self.feature_fusion = nn.Sequential(
-            nn.LazyLinear(256),
+            nn.Linear(64 + 32 + 128, 256),
             nn.ELU(),
             nn.Linear(256, 256),
             nn.LayerNorm(256),
         )
 
     def forward(self, obs):
-        state = obs["state"]
-        lidar = obs["lidar"]
-        dynamic_obstacle = obs["dynamic_obstacle"]
-
-        lidar_feature = self.lidar_encoder(lidar)
-        dynamic_feature = self.dynamic_encoder(dynamic_obstacle)
-
-        feature = torch.cat([lidar_feature, state, dynamic_feature], dim=-1)
+        state_feature = self.state_encoder(obs["state"])
+        goal_feature = self.goal_encoder(obs["goal"])
+        depth_feature = self.depth_encoder(obs["depth"])
+        feature = torch.cat([state_feature, goal_feature, depth_feature], dim=-1)
         return self.feature_fusion(feature)
 
 
@@ -153,7 +161,11 @@ class PPO(nn.Module):
         self.cfg = cfg
         self.device = device
         self.action_dim = int(action_space)
-        self.action_limit = cfg.actor.action_limit
+        if self.action_dim != 3:
+            raise ValueError("Navigation PPO requires three body-frame velocity actions.")
+        self.action_limit = float(cfg.actor.action_limit)
+        if not math.isfinite(self.action_limit) or self.action_limit <= 0.0:
+            raise ValueError("actor.action_limit must be a finite, positive per-axis speed in m/s.")
 
         self.feature_extractor = PPOFeatureExtractor().to(device)
         self.actor = PPOActor(self.action_dim).to(device)
@@ -183,7 +195,7 @@ class PPO(nn.Module):
 
             action_normalized, log_prob = self.actor.sample(feature)
             state_value = self.critic(feature)
-            action = self._to_world_action(action_normalized, obs["direction"])
+            action = self._to_body_action(action_normalized)
 
             tensordict["agents", "action_normalized"] = action_normalized
             tensordict["agents", "action"] = action
@@ -198,7 +210,7 @@ class PPO(nn.Module):
         obs = tensordict["agents", "observation"]
         feature = self.feature_extractor(obs)
         action_normalized = self.actor.deterministic(feature)
-        action = self._to_world_action(action_normalized, obs["direction"])
+        action = self._to_body_action(action_normalized)
 
         tensordict["agents", "action_normalized"] = action_normalized
         tensordict["agents", "action"] = action
@@ -325,27 +337,34 @@ class PPO(nn.Module):
         self.critic.load_state_dict(checkpoint["critic"])
         self.value_norm.load_state_dict(checkpoint["value_norm"])
 
+    @torch.no_grad()
     def _initialize_lazy_modules(self, observation_space):
-        obs = {
-            "state": torch.zeros(1, observation_space["state"], device=self.device),
-            "lidar": torch.zeros(1, *observation_space["lidar"], device=self.device),
-            "dynamic_obstacle": torch.zeros(
-                1,
-                *observation_space["dynamic_obstacle"],
-                device=self.device,
-            ),
-        }
+        """按无 batch 维的观测形状初始化；向量也兼容整数维数 9、4。"""
+        shapes = {}
+        for key in ("state", "goal", "depth"):
+            shape = observation_space[key]
+            shapes[key] = (shape,) if isinstance(shape, int) else tuple(shape)
+        if shapes["state"] != (9,) or shapes["goal"] != (4,):
+            raise ValueError("Navigation PPO expects state shape (9,) and goal shape (4,).")
+        depth_shape = shapes["depth"]
+        if len(depth_shape) != 3 or depth_shape[0] != 1 or any(size <= 0 for size in depth_shape):
+            raise ValueError("Navigation PPO expects depth shape (1, H, W) with positive dimensions.")
+        obs = {key: torch.zeros(1, *shape, device=self.device) for key, shape in shapes.items()}
         feature = self.feature_extractor(obs)
         self.actor(feature)
         self.critic(feature)
 
     def _flatten_observation(self, obs):
+        """合并 rollout 的 (N, T)，保留状态维数和深度图的 (1, H, W)。"""
         return {
             key: value.reshape(-1, *value.shape[2:])
             for key, value in obs.items()
         }
 
-    def _to_world_action(self, action_normalized, direction):
-        action = 2.0 * action_normalized * self.action_limit - self.action_limit
-        action = vec_to_world(action, direction)
-        return action.squeeze(1)
+    def _to_body_action(self, action_normalized):
+        """Beta 样本 (B, 3) 映射为机体系 [前、左、上] 速度，单位 m/s。
+
+        action_limit 是逐轴上限；完整姿态的世界系转换由环境 Action 完成。
+        log_prob 和 PPO 更新始终使用映射前的 action_normalized。
+        """
+        return (2.0 * action_normalized - 1.0) * self.action_limit

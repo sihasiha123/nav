@@ -1,3 +1,4 @@
+import math
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import (
@@ -14,7 +15,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.sensors import MultiMeshRayCasterCameraCfg, patterns
 
 from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.terrains.height_field import HfDiscreteObstaclesTerrainCfg
@@ -29,6 +30,7 @@ from . import mdp
 
 from nav.assets.quadcopter import DRONE_NO_COLLIDER_CFG
 from nav.assets.dynamic import make_global_obstacle_collection_cfg
+from nav.assets.terrain import CollisionTerrainImporter
 
 
 ##
@@ -43,6 +45,7 @@ class NavSceneCfg(InteractiveSceneCfg):
     )
 
     terrain = TerrainImporterCfg(
+        class_type=CollisionTerrainImporter,
         prim_path="/World/ground",
         terrain_type="generator",
         terrain_generator=TerrainGeneratorCfg(
@@ -78,27 +81,49 @@ class NavSceneCfg(InteractiveSceneCfg):
     # 无人机
     robot: ArticulationCfg = DRONE_NO_COLLIDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-    # 激光雷达：扫描共享地形，量程 4m，36 水平 x 4 垂直光束
-    lidar: RayCasterCfg = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/body",
-        update_period=0.0,
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
-        ray_alignment="yaw",
-        pattern_cfg=patterns.LidarPatternCfg(
-            channels=4,
-            vertical_fov_range=(-10.0, 20.0),
-            horizontal_fov_range=(0.0, 360.0),
-            horizontal_res=10.0,
-        ),
-        debug_vis=False,
-        mesh_prim_paths=["/World/ground"],
-    )
-
     # 所有机器人环境共享同一套全局障碍物；中心高度在无人机飞行范围内随机；
     # count=0 时返回 None（禁用）
     dynamic_obstacles: RigidObjectCollectionCfg | None = make_global_obstacle_collection_cfg(
         count=100,
         obstacle_height_range=(1.0, 2.5),
+    )
+
+    # 前视深度相机：96 x 54，水平视场 120°，深度上限 4m。
+    # 固定在 body 上并跟随完整姿态，查询共享地形与每个独立运动的障碍物。
+    depth_camera: MultiMeshRayCasterCameraCfg = MultiMeshRayCasterCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/body",
+        update_period=0.0,
+        offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
+            pos=(0.0, 0.0, 0.0),
+            rot=(1.0, 0.0, 0.0, 0.0),
+            # 朝向约定为 +X 向前、+Z 向上；相机仍固定于 body。
+            convention="world",
+        ),
+        ray_alignment="base",
+        pattern_cfg=patterns.PinholeCameraPatternCfg(
+            width=96,
+            height=54,
+            focal_length=1.0,
+            # horizontal_aperture = 2 * focal_length * tan(horizontal_fov / 2)
+            horizontal_aperture=2.0 * math.tan(math.radians(120.0 / 2.0)),
+        ),
+        data_types=["distance_to_image_plane"],
+        max_distance=4.0,
+        depth_clipping_behavior="max",
+        debug_vis=False,
+        mesh_prim_paths=[
+            # 静态目标使用字符串路径，默认不跟踪位姿。
+            "/World/ground",
+            *[
+                MultiMeshRayCasterCameraCfg.RaycastTargetCfg(
+                    prim_expr=obstacle_cfg.prim_path,
+                    track_mesh_transforms=True,
+                )
+                for obstacle_cfg in (
+                    dynamic_obstacles.rigid_objects.values() if dynamic_obstacles is not None else ()
+                )
+            ],
+        ],
     )
 
     # 灯光
@@ -117,28 +142,40 @@ class NavSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """MDP 的动作项配置。"""
 
-    # 无人机三维世界系速度指令 [vx, vy, vz]（m/s）
-    uav_velocity = mdp.UavVelocityActionCfg(asset_name="robot")
+    # 输入机体系实际速度 [前、左、上]（m/s），动作项内部转为世界系。
+    uav_velocity = mdp.UavVelocityActionCfg(
+        asset_name="robot",
+        body_name="body",
+        scale=1.0,
+        max_velocity=None,
+    )
 
 
 
 @configclass
 class ObservationsCfg:
-    """MDP 的观测项配置（导航版，全部转 goal frame）。"""
+    """导航观测：机体系自身状态、相对目标与单帧深度图。"""
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """策略观测组。"""
+        """三个独立 float32 Tensor，不包含历史帧或障碍物真值。"""
 
-        state = ObsTerm(func=mdp.state_obs, params={"asset_cfg": SceneEntityCfg("robot")})
-        lidar = ObsTerm(func=mdp.lidar_obs, params={"asset_cfg": SceneEntityCfg("lidar")})
-        direction = ObsTerm(func=mdp.direction_obs)
-        dynamic_obstacle: ObsTerm | None = ObsTerm(func=mdp.dynamic_obstacle_obs)
+        # (N, 9)：线速度 B(3)、重力单位方向 B(3)、角速度 B(3)。
+        state = ObsTerm(
+            func=mdp.state_obs,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=["body"])},
+        )
+        # (N, 4)：目标单位方向 B(3)、目标距离(1)。
+        goal = ObsTerm(
+            func=mdp.goal_obs,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=["body"])},
+        )
+        # (N, 1, 54, 96)：深度除以相机最大距离，范围 [0, 1]。
+        depth = ObsTerm(func=mdp.depth_obs, params={"asset_cfg": SceneEntityCfg("depth_camera")})
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
-            # 保持 dict 结构（state/lidar/direction/dynamic 分开），
-            # 便于后续网络分别编码（lidar 用 CNN，其余用 MLP）。
+            # 环境只提供 state/goal/depth 字典；特征编码由算法负责。
             self.concatenate_terms = False
 
     # 观测组
@@ -149,14 +186,18 @@ class ObservationsCfg:
 class EventCfg:
     """事件项配置。"""
 
-    # 重置：从地图边界随机起点；目标由 CommandManager 生成
+    # 只在启动时初始化共享运动管理器，不随单架无人机 reset。
+    initialize_dynamic_obstacles = EventTerm(func=mdp.initialize_dynamic_obstacles, mode="startup")
+
+    # 重置：+Y 边起飞，X 均匀分布、高度随机；只设置无人机初始状态。
     reset_robot_state = EventTerm(
         func=mdp.reset_robot_state,
         mode="reset",
         params={
-            "map_range": (20.0, 20.0, 6.0),
+            "asset_cfg": SceneEntityCfg("robot"),
+            "start_x_range": (-22.0, 22.0),
+            "start_y": 22.0,
             "start_z_range": (0.5, 2.5),
-            "boundary_offset": 2.0,
             "yaw_angle": -1.5707963267948966,
         },
     )
@@ -164,10 +205,11 @@ class EventCfg:
 
 @configclass
 class CommandsCfg:
-    """导航目标命令配置。"""
+    """导航终点配置：保留起点 X/Z，将 Y 设置为地图另一侧。"""
 
     nav_target = mdp.NavTargetCommandCfg(
         asset_name="robot",
+        body_name="body",
         target_y=-22.0,
         resampling_time_range=(1.0e9, 1.0e9),
     )
@@ -177,17 +219,56 @@ class CommandsCfg:
 class RewardsCfg:
     """MDP 的奖励项配置（uav 权重）。"""
 
-    navigation = RewTerm(func=mdp.NavigationReward, weight=1.0)
+    navigation = RewTerm(
+        func=mdp.NavigationReward,
+        weight=1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["body"]),
+            "camera_cfg": SceneEntityCfg("depth_camera"),
+        },
+    )
 
 
 @configclass
 class TerminationsCfg:
-    """MDP 的终止项配置。"""
+    """每步检查，任一条件成立即结束；保留各原因供日志统计。"""
 
-    static_collision = DoneTerm(func=mdp.static_collision, params={"asset_cfg": SceneEntityCfg("lidar")})
-    dynamic_collision: DoneTerm | None = DoneTerm(func=mdp.dynamic_collision)
-    out_of_bounds = DoneTerm(func=mdp.out_of_bounds)
-    success = DoneTerm(func=mdp.success)
+    # 0.3m 暂沿用旧碰撞半径，需在服务器结合无人机实际尺寸核对。
+    static_collision = DoneTerm(
+        func=mdp.StaticCollision,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["body"]),
+            "robot_radius": 0.3,
+            "terrain_name": "terrain",
+            "ground_height": 0.0,
+        },
+    )
+    dynamic_collision: DoneTerm | None = DoneTerm(
+        func=mdp.DynamicCollision,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["body"]),
+            "robot_radius": 0.3,
+            "obstacle_name": "dynamic_obstacles",
+        },
+    )
+    out_of_bounds = DoneTerm(
+        func=mdp.out_of_bounds,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["body"]),
+            "x_range": (-24.0, 24.0),
+            "y_range": (-24.0, 24.0),
+            "z_range": (0.2, 4.0),
+        },
+    )
+    # 必须放在失败项之后，复用它们本步的判断；碰撞/越界时不能同时成功。
+    success = DoneTerm(
+        func=mdp.success,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["body"]),
+            "goal_radius": 0.5,
+            "failure_terms": ("static_collision", "dynamic_collision", "out_of_bounds"),
+        },
+    )
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
 
@@ -239,9 +320,8 @@ class NavEnvCfg(ManagerBasedRLEnvCfg):
     # 后初始化
     def __post_init__(self) -> None:
         """完成环境配置的后初始化。"""
-        # 动态障碍物大开关：场景中没有刚体集合时，关闭观测与终止相关项。
+        # 动态障碍物大开关：场景中没有刚体集合时，关闭动态碰撞终止项。
         if self.scene.dynamic_obstacles is None:
-            self.observations.policy.dynamic_obstacle = None
             self.terminations.dynamic_collision = None
         # 通用配置
         self.decimation = 1

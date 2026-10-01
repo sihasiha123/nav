@@ -14,6 +14,7 @@ from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 
 from nav.assets.dynamic import get_global_obstacle_manager, has_scene_entity
 from .commands import get_nav_target_command
+from .observations import _body_link_state_w, depth_obs
 
 __all__ = ["NavigationReward"]
 
@@ -23,13 +24,12 @@ __all__ = ["NavigationReward"]
 ##
 
 
-def _lidar_distance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, lidar_range: float) -> torch.Tensor:
-    """读取奖励计算所需的 LiDAR 距离。"""
-    lidar = env.scene[asset_cfg.name]
-    ray_starts_w = lidar.data.pos_w.unsqueeze(1)
-    distance = torch.linalg.norm(lidar.data.ray_hits_w - ray_starts_w, dim=-1)
-    distance = torch.nan_to_num(distance, nan=lidar_range, posinf=lidar_range, neginf=lidar_range)
-    return distance.clamp_max(lidar_range)
+def _termination_flag(env: ManagerBasedRLEnv, name: str) -> torch.Tensor:
+    """读取本步终止结果，转为奖励使用的 (N, 1)，兼容关闭的动态碰撞项。"""
+    manager = env.termination_manager
+    if name == "dynamic_collision" and name not in manager.active_terms:
+        return torch.zeros((env.num_envs, 1), dtype=torch.bool, device=env.device)
+    return manager.get_term(name).reshape(env.num_envs, 1)
 
 
 def _obstacle_size(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -69,26 +69,24 @@ class NavigationReward(ManagerTermBase):
         self.prev_drone_vel_w[env_ids] = 0.0
         self.reached_goal_once[env_ids] = False
         self._initialized[env_ids] = False
-        for value in self.reward_components.values():
-            value[env_ids] = 0.0
+        # reward_components 是最近一步的输出快照，不是回合历史状态。
+        # env.step() 内部自动 reset 后 Trainer 才读取它，故保留结束步分项；
+        # 下一次 __call__ 会覆盖所有环境的分项。构造时已初始化为零。
 
     def __call__(
         self,
         env: ManagerBasedRLEnv,
-        lidar_range: float = 4.0,
+        asset_cfg: SceneEntityCfg,
+        camera_cfg: SceneEntityCfg,
         static_safe_distance: float = 1.2,
         dynamic_safe_distance: float = 1.5,
-        goal_radius: float = 0.5,
-        z_min: float = 0.2,
-        z_max: float = 4.0,
         out_of_bounds_penalty: float = 120.0,
     ) -> torch.Tensor:
         """导航奖励：进展、速度、静态/动态避障、高度、平滑、时间、到达与碰撞。"""
-        robot = env.scene["robot"]
-        root_state = robot.data.root_state_w
-        drone_pos_w = root_state[:, 0:3]
-        drone_vel_w = root_state[:, 7:10]
-        drone_z = root_state[:, 2:3]
+        body_state = _body_link_state_w(env, asset_cfg)
+        drone_pos_w = body_state[:, 0:3]
+        drone_vel_w = body_state[:, 7:10]
+        drone_z = body_state[:, 2:3]
 
         # 目标进展与朝目标速度
         target_command = get_nav_target_command(env)
@@ -96,19 +94,20 @@ class NavigationReward(ManagerTermBase):
         target_dir_w = target_pos_w - drone_pos_w
         distance = torch.linalg.norm(target_dir_w, dim=-1, keepdim=True)
         vel_direction = target_dir_w / distance.clamp_min(1.0e-6)
-        initial_distance = torch.linalg.norm(target_command[:, 3:], dim=-1, keepdim=True)
+        initial_distance = env.command_manager.get_term("nav_target").initial_distance
         previous_distance = torch.where(self._initialized, self.prev_distance, initial_distance)
         reward_progress = previous_distance - distance
         reward_vel = (drone_vel_w * vel_direction).sum(dim=-1, keepdim=True)
 
-        # 静态障碍（LiDAR 推断）
-        lidar_distance_w = _lidar_distance(env, SceneEntityCfg("lidar"), lidar_range)
-        static_clearance = lidar_distance_w.amin(dim=-1, keepdim=True)
+        # 沿用原 static_avoidance 项和权重，距离来源改为米制相机光轴深度。
+        # 深度不区分静态/动态；此项会处罚视野中两类障碍，不能用于判定碰撞。
+        # 复用观测的无效值处理，避免两处对同一帧采用不同的清理规则。
+        depth = depth_obs(env, camera_cfg)
+        sensing_range = float(env.scene[camera_cfg.name].cfg.max_distance)
+        static_clearance = depth.flatten(start_dim=1).amin(dim=-1, keepdim=True) * sensing_range
         penalty_static = torch.relu(static_safe_distance - static_clearance).pow(2)
-        static_collision = lidar_distance_w.amin(dim=-1, keepdim=True) < 0.3
 
         # 动态障碍（最近 5 个）
-        dynamic_collision = torch.zeros(env.num_envs, 1, dtype=torch.bool, device=env.device)
         penalty_dynamic = torch.zeros(env.num_envs, 1, device=env.device)
         if has_scene_entity(env, "dynamic_obstacles"):
             manager = get_global_obstacle_manager(env)
@@ -120,26 +119,17 @@ class NavigationReward(ManagerTermBase):
                 rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos_w.unsqueeze(1)
                 distance_2d_all = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)
                 nearest_ids = torch.topk(distance_2d_all, k=num_observed, largest=False).indices
-                range_mask = torch.gather(distance_2d_all, 1, nearest_ids) > lidar_range
+                range_mask = torch.gather(distance_2d_all, 1, nearest_ids) > sensing_range
 
                 gather_ids = nearest_ids.unsqueeze(-1).expand(-1, -1, 3)
                 rel_pos_w = torch.gather(rel_pos_w, 1, gather_ids)
                 obstacle_dimensions = obstacle_dimensions.unsqueeze(0).expand(env.num_envs, -1, -1)
                 obstacle_dimensions = torch.gather(obstacle_dimensions, 1, gather_ids)
                 obstacle_width = obstacle_dimensions[:, :, 0:1]
-                obstacle_height = obstacle_dimensions[:, :, 2:3]
-
-                distance_2d = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1, keepdim=True)
-                distance_z = rel_pos_w[:, :, 2:3].abs()
-                distance_2d[range_mask] = float("inf")
-                distance_z[range_mask] = float("inf")
-                collision_2d = distance_2d <= obstacle_width * 0.5 + 0.3
-                collision_z = distance_z <= obstacle_height * 0.5 + 0.3
-                dynamic_collision = (collision_2d & collision_z).any(dim=1)
 
                 dynamic_clearance = torch.linalg.norm(rel_pos_w, dim=-1) - obstacle_width.squeeze(-1) * 0.5
-                dynamic_clearance[range_mask] = lidar_range
-                dynamic_clearance = dynamic_clearance.clamp(min=0.0, max=lidar_range)
+                dynamic_clearance[range_mask] = sensing_range
+                dynamic_clearance = dynamic_clearance.clamp(min=0.0, max=sensing_range)
                 penalty_dynamic = torch.relu(dynamic_safe_distance - dynamic_clearance).pow(2).mean(dim=-1, keepdim=True)
 
         # 高度范围
@@ -155,10 +145,11 @@ class NavigationReward(ManagerTermBase):
         # 平滑
         penalty_smooth = torch.linalg.norm(drone_vel_w - self.prev_drone_vel_w, dim=-1, keepdim=True)
 
-        collision = static_collision | dynamic_collision
-        out_of_bounds = (drone_z < z_min) | (drone_z > z_max)
-        reach_goal = distance < goal_radius
-        safe_reach_goal = reach_goal & ~collision
+        # 环境先计算 Termination 再计算 Reward；直接复用当前步结果。
+        # 两种碰撞同一步发生也只扣一次碰撞分；越界仍保留原来的独立扣分。
+        collision = _termination_flag(env, "static_collision") | _termination_flag(env, "dynamic_collision")
+        out_of_bounds = _termination_flag(env, "out_of_bounds")
+        safe_reach_goal = _termination_flag(env, "success")
         first_reach_goal = safe_reach_goal & ~self.reached_goal_once
 
         progress_term = 4.0 * reward_progress

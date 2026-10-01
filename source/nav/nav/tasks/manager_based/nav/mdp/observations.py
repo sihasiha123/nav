@@ -1,189 +1,81 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
 
-"""导航任务观测：全部转到 episode 内固定的 goal frame。"""
+"""单步导航观测：机体系自身状态、相对目标与前视深度图。"""
 
 from __future__ import annotations
+
+import math
 
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import quat_apply_inverse
 
-from nav.assets.dynamic import get_global_obstacle_manager, has_scene_entity
 from .commands import get_nav_target_command
 
-__all__ = [
-    "direction_obs",
-    "dynamic_obstacle_obs",
-    "lidar_obs",
-    "state_obs",
-    "vec_to_new_frame",
-]
+__all__ = ["depth_obs", "goal_obs", "state_obs"]
 
 
-##
-# 坐标工具
-##
-
-
-def _lidar_distance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, lidar_range: float) -> torch.Tensor:
-    """读取 LiDAR 距离；该实现只服务于观测项。"""
-    lidar = env.scene[asset_cfg.name]
-    ray_starts_w = lidar.data.pos_w.unsqueeze(1)
-    distance = torch.linalg.norm(lidar.data.ray_hits_w - ray_starts_w, dim=-1)
-    distance = torch.nan_to_num(distance, nan=lidar_range, posinf=lidar_range, neginf=lidar_range)
-    # 当前传感器为 36 个水平角度 x 4 个垂直通道，保留二维网格供 CNN 使用。
-    return distance.clamp_max(lidar_range).reshape(env.num_envs, 1, 36, 4)
-
-
-def _obstacle_size(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """读取动态障碍物尺寸；该实现只服务于动态障碍物观测。"""
-    collection_cfg = env.scene["dynamic_obstacles"].cfg
-    first_spawn = next(iter(collection_cfg.rigid_objects.values())).spawn
-    size = torch.tensor(first_spawn.size, device=env.device, dtype=torch.float32)
-    return size.unsqueeze(0).repeat(len(collection_cfg.rigid_objects), 1)
-
-
-def vec_to_new_frame(vec: torch.Tensor, goal_direction: torch.Tensor) -> torch.Tensor:
-    """把向量转到 goal frame（x 轴沿任务方向，z 轴保持世界垂直）。"""
-    if vec.dim() == 1:
-        vec = vec.unsqueeze(0)
-
-    goal_direction_x = goal_direction / goal_direction.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
-    z_direction = torch.tensor([0.0, 0.0, 1.0], device=vec.device)
-    goal_direction_y = torch.cross(z_direction.expand_as(goal_direction_x), goal_direction_x, dim=-1)
-    goal_direction_y = goal_direction_y / goal_direction_y.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
-    goal_direction_z = torch.cross(goal_direction_x, goal_direction_y, dim=-1)
-    goal_direction_z = goal_direction_z / goal_direction_z.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
-
-    n = vec.size(0)
-    if vec.dim() == 3:
-        vec_x = torch.bmm(vec.view(n, vec.shape[1], 3), goal_direction_x.view(n, 3, 1))
-        vec_y = torch.bmm(vec.view(n, vec.shape[1], 3), goal_direction_y.view(n, 3, 1))
-        vec_z = torch.bmm(vec.view(n, vec.shape[1], 3), goal_direction_z.view(n, 3, 1))
-    else:
-        vec_x = torch.bmm(vec.view(n, 1, 3), goal_direction_x.view(n, 3, 1))
-        vec_y = torch.bmm(vec.view(n, 1, 3), goal_direction_y.view(n, 3, 1))
-        vec_z = torch.bmm(vec.view(n, 1, 3), goal_direction_z.view(n, 3, 1))
-
-    return torch.cat((vec_x, vec_y, vec_z), dim=-1)
-
-
-##
-# 观测项
-##
-
-
-def _goal_frame_direction(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """返回归一化的 2D 任务方向（goal frame x 轴），形状 ``(num_envs, 3)``。"""
-    target_dir = get_nav_target_command(env)[:, 3:].clone()
-    target_dir_2d = target_dir
-    target_dir_2d[:, 2] = 0.0
-    target_dir_norm = torch.linalg.norm(target_dir_2d, dim=-1, keepdim=True)
-    fallback_dir = torch.zeros_like(target_dir_2d)
-    fallback_dir[:, 0] = 1.0
-    return torch.where(target_dir_norm > 1.0e-6, target_dir_2d, fallback_dir)
+def _body_link_state_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """读取配置指定的唯一机身 link，返回世界系状态 ``(N, 13)``。"""
+    robot = env.scene[asset_cfg.name]
+    # body_ids 由 Manager 根据 body_names 解析，可以是列表或 slice。
+    body_state = robot.data.body_link_state_w[:, asset_cfg.body_ids, :]
+    if body_state.shape[1] != 1:
+        raise ValueError("Navigation observations require exactly one body selected by asset_cfg.body_names.")
+    # 位置、姿态及速度均对应 link 原点，避免混用根节点或质心状态。
+    return body_state[:, 0, :].to(dtype=torch.float32)
 
 
 def state_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """8 维状态：目标方向(3) + 2D 距离(1) + z 距离(1) + 速度(3)，全部转 goal frame。"""
-    robot = env.scene[asset_cfg.name]
-    root_state = robot.data.root_state_w
-    drone_pos_w = root_state[:, 0:3]
-    drone_lin_vel_w = root_state[:, 7:10]
+    """自身状态 ``(N, 9)``，float32，保留在环境设备上。
 
-    target_pos_w = get_nav_target_command(env)[:, :3]
-    target_dir_w = target_pos_w - drone_pos_w
-    goal_direction = _goal_frame_direction(env)
+    顺序为机体系线速度 [0:3]（m/s）、重力单位方向 [3:6]、
+    机体系角速度 [6:9]（rad/s）。速度不做缩放，无历史帧。
+    机体系跟随所选 body 的完整姿态，包括横滚、俯仰和偏航。
+    """
+    body_state = _body_link_state_w(env, asset_cfg)
+    quat_w = body_state[:, 3:7]
+    lin_vel_b = quat_apply_inverse(quat_w, body_state[:, 7:10])
+    ang_vel_b = quat_apply_inverse(quat_w, body_state[:, 10:13])
 
-    distance = torch.linalg.norm(target_dir_w, dim=-1, keepdim=True)
-    distance_2d = torch.linalg.norm(target_dir_w[:, :2], dim=-1, keepdim=True)
-    distance_z = target_dir_w[:, 2:3]
-    target_dir_unit = target_dir_w / distance.clamp_min(1.0e-6)
-    target_dir_goal = vec_to_new_frame(target_dir_unit, goal_direction).squeeze(1)
-    drone_vel_goal = vec_to_new_frame(drone_lin_vel_w, goal_direction).squeeze(1)
-
-    return torch.cat([target_dir_goal, distance_2d, distance_z, drone_vel_goal], dim=-1)
+    # 这是仿真重力的单位方向，不是加速度计读数；使用 body 的姿态投影。
+    gravity_w = env.scene[asset_cfg.name].data.GRAVITY_VEC_W.to(dtype=torch.float32)
+    gravity_b = quat_apply_inverse(quat_w, gravity_w)
+    return torch.cat((lin_vel_b, gravity_b, ang_vel_b), dim=-1)
 
 
-def lidar_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, lidar_range: float = 4.0) -> torch.Tensor:
-    """LiDAR 距离图，形状 ``(num_envs, 1, 36, 4)``。"""
-    # 几何模块返回距离；策略观测使用“越近数值越大”的接近度语义。
-    return lidar_range - _lidar_distance(env, asset_cfg, lidar_range)
+def goal_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """相对目标 ``(N, 4)``：机体系单位方向 [0:3] + 三维距离 [3:4]（m）。
+
+    世界系目标仍由 CommandManager 保存；这里只读取其位置部分。
+    目标与 body 原点重合时方向为零。输出 float32，不缩放距离。
+    """
+    body_state = _body_link_state_w(env, asset_cfg)
+    target_pos_w = get_nav_target_command(env)[:, :3].to(dtype=torch.float32)
+    relative_pos_w = target_pos_w - body_state[:, :3]
+    distance = torch.linalg.vector_norm(relative_pos_w, dim=-1, keepdim=True)
+    relative_pos_b = quat_apply_inverse(body_state[:, 3:7], relative_pos_w)
+    # 零距离使用分母 1，避免除零；非零距离保留真正的单位方向。
+    direction_b = relative_pos_b / torch.where(distance > 0.0, distance, torch.ones_like(distance))
+    return torch.cat((direction_b, distance), dim=-1)
 
 
-def direction_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """固定任务方向，形状 ``(num_envs, 1, 3)``。"""
-    return _goal_frame_direction(env).unsqueeze(1)
+def depth_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """单帧深度 ``(N, 1, H, W)``，当前为 ``(N, 1, 54, 96)``。
 
+    读取沿相机光轴的深度，以相机 max_distance（当前 4m）归一化。
+    输出 float32、范围 [0, 1]，越远数值越大；1 是通道数而非历史帧数。
+    """
+    camera = env.scene[asset_cfg.name]
+    max_distance = float(camera.cfg.max_distance)
+    if not math.isfinite(max_distance) or max_distance <= 0.0:
+        raise ValueError("Depth normalization requires a finite, positive camera max_distance.")
 
-def dynamic_obstacle_obs(
-    env: ManagerBasedRLEnv,
-    num_observed: int = 5,
-    lidar_range: float = 4.0,
-) -> torch.Tensor:
-    """最近 ``num_observed`` 个动态障碍物的 10 维观测，形状 ``(num_envs, 1, 5, 10)``。"""
-    drone_pos_w = env.scene["robot"].data.root_state_w[:, 0:3]
-    goal_direction = _goal_frame_direction(env)
-
-    dynamic_obstacle = torch.zeros(
-        (env.num_envs, 1, num_observed, 10),
-        dtype=torch.float32,
-        device=env.device,
-    )
-
-    if not has_scene_entity(env, "dynamic_obstacles"):
-        return dynamic_obstacle
-
-    manager = get_global_obstacle_manager(env)
-    obstacle_pos_w = manager.position_w[0]
-    obstacle_vel_w = manager.linear_velocity_w[0]
-    obstacle_dimensions = _obstacle_size(env)
-    num_obstacles = obstacle_pos_w.shape[0]
-    num_observed = min(num_observed, num_obstacles)
-
-    if num_observed > 0:
-        rel_pos_w = obstacle_pos_w.unsqueeze(0) - drone_pos_w.unsqueeze(1)
-        distance_2d_all = torch.linalg.norm(rel_pos_w[:, :, :2], dim=-1)
-        nearest_ids = torch.topk(distance_2d_all, k=num_observed, largest=False).indices
-        range_mask = torch.gather(distance_2d_all, 1, nearest_ids) > lidar_range
-
-        gather_ids = nearest_ids.unsqueeze(-1).expand(-1, -1, 3)
-        rel_pos_w = torch.gather(rel_pos_w, 1, gather_ids)
-        rel_pos_goal = vec_to_new_frame(rel_pos_w, goal_direction)
-        rel_pos_goal[range_mask] = 0.0
-
-        obstacle_vel_w = obstacle_vel_w[nearest_ids]
-        obstacle_vel_w[range_mask] = 0.0
-        obstacle_vel_goal = vec_to_new_frame(obstacle_vel_w, goal_direction)
-
-        obstacle_dimensions = obstacle_dimensions.unsqueeze(0).expand(env.num_envs, -1, -1)
-        obstacle_dimensions = torch.gather(obstacle_dimensions, 1, gather_ids)
-        obstacle_width = obstacle_dimensions[:, :, 0:1]
-        obstacle_height = obstacle_dimensions[:, :, 2:3]
-
-        rel_distance = torch.linalg.norm(rel_pos_w, dim=-1, keepdim=True)
-        rel_distance_2d = torch.linalg.norm(rel_pos_goal[:, :, :2], dim=-1, keepdim=True)
-        rel_distance_z = rel_pos_goal[:, :, 2:3]
-        rel_pos_goal_unit = rel_pos_goal / rel_distance.clamp_min(1.0e-6)
-
-        width_category = obstacle_width / 0.25 - 1.0
-        height_category = torch.where(obstacle_height > 1.0, torch.zeros_like(obstacle_height), obstacle_height)
-        width_category[range_mask] = 0.0
-        height_category[range_mask] = 0.0
-
-        dynamic_obstacle[:, 0, :num_observed, :] = torch.cat(
-            [
-                rel_pos_goal_unit,
-                rel_distance_2d,
-                rel_distance_z,
-                obstacle_vel_goal,
-                width_category,
-                height_category,
-            ],
-            dim=-1,
-        )
-    return dynamic_obstacle
+    depth = camera.data.output["distance_to_image_plane"].to(dtype=torch.float32)
+    if depth.ndim != 4 or depth.shape[-1] != 1:
+        raise ValueError(f"Expected camera depth shape (N, H, W, 1), received {tuple(depth.shape)}.")
+    # 传感器已负责超量程裁剪；这里作轻量兜底，不修改相机原始缓冲区。
+    depth = torch.nan_to_num(depth, nan=max_distance, posinf=max_distance, neginf=0.0)
+    depth = depth.clamp(0.0, max_distance) / max_distance
+    return depth.permute(0, 3, 1, 2).contiguous()

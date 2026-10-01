@@ -10,6 +10,7 @@ __all__ = [
     "ValueNorm",
     "make_mlp",
     "obs_to_tensordict",
+    "navigation_observation_shapes",
     "vec_to_world",
 ]
 
@@ -53,17 +54,34 @@ class ValueNorm(nn.Module):
         return value * torch.sqrt(var) + mean
 
 
+def navigation_observation_shapes(env):
+    """训练和评估共用接口：从带 N 维的环境空间读取无 batch 维的形状。"""
+    policy_space = env.observation_space["policy"]
+    num_envs = env.unwrapped.num_envs
+    shapes = {}
+    for key, expected in (("state", (9,)), ("goal", (4,)), ("depth", (1, 54, 96))):
+        shape = tuple(policy_space[key].shape)
+        if shape != (num_envs, *expected):
+            raise ValueError(f"Expected {key} observation shape {(num_envs, *expected)}, got {shape}.")
+        shapes[key] = shape[1:]
+    if tuple(env.action_space.shape) != (num_envs, 3):
+        raise ValueError("Navigation requires batched body-frame velocity actions with shape (N, 3).")
+    return shapes
+
+
 def obs_to_tensordict(obs, num_envs, device):
-    """把环境返回的观测 dict 包装成 TensorDict（兼容 ``{"policy": {...}}``）。"""
+    """包装 state (N,9)、goal (N,4)、depth (N,1,H,W)，保留图像维度。
+
+    兼容环境返回的 ``{"policy": {...}}`` 以及 reset 的 (obs, info)。
+    """
     if isinstance(obs, tuple):
         obs = obs[0]
     if "policy" in obs:
         obs = obs["policy"]
     obs = {
         "state": obs["state"].to(device),
-        "lidar": obs["lidar"].to(device),
-        "direction": obs["direction"].to(device),
-        "dynamic_obstacle": obs["dynamic_obstacle"].to(device),
+        "goal": obs["goal"].to(device),
+        "depth": obs["depth"].to(device),
     }
     return TensorDict(
         {

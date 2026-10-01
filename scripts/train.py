@@ -40,7 +40,7 @@ from tensordict import TensorDict  # noqa: E402
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: E402
 
 import nav.tasks  # noqa: F401, E402
-from nav.tasks.manager_based.nav.agents.common import obs_to_tensordict  # noqa: E402
+from nav.tasks.manager_based.nav.agents.common import navigation_observation_shapes, obs_to_tensordict  # noqa: E402
 from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
 
 
@@ -76,7 +76,7 @@ def to_float(value):
 
 
 class RolloutEnvStatistics:
-    """统计当前 rollout 内所有 done 环境的终止原因。"""
+    """统计结束步各终止项的触发次数；同一步可计入多个项，不是互斥分类。"""
 
     def __init__(self, env):
         self._env = env
@@ -115,8 +115,8 @@ class RolloutEnvStatistics:
         denom = float(done_count)
         for term_name, term_count in self._term_counts.items():
             count = int(term_count.item())
-            metrics[f"Rollout_Termination/{term_name}_count"] = count
-            metrics[f"Rollout_Termination/{term_name}_rate"] = count / denom
+            metrics[f"Rollout_TerminationTrigger/{term_name}_count"] = count
+            metrics[f"Rollout_TerminationTrigger/{term_name}_rate"] = count / denom
         collision_count = int(self._collision_count.item())
         metrics["Rollout_Result/collision_count"] = collision_count
         metrics["Rollout_Result/collision_rate"] = collision_count / denom
@@ -203,10 +203,10 @@ def collect_terminal_log_items(env_log, algo_log):
     log_items["rollout/step_reward_mean"] = algo_log["Rollout_Reward/step_mean"]
 
     result_keys = {
-        "success_rate": "Rollout_Termination/success_rate",
+        "success_rate": "Rollout_TerminationTrigger/success_rate",
         "collision_rate": "Rollout_Result/collision_rate",
-        "out_of_bounds_rate": "Rollout_Termination/out_of_bounds_rate",
-        "time_out_rate": "Rollout_Termination/time_out_rate",
+        "out_of_bounds_trigger_rate": "Rollout_TerminationTrigger/out_of_bounds_rate",
+        "time_out_trigger_rate": "Rollout_TerminationTrigger/time_out_rate",
     }
     for display_name, source_name in result_keys.items():
         if source_name in env_log:
@@ -282,13 +282,7 @@ def init_wandb(run_dir, env_cfg):
 
 def make_agent(algo, cfg, env):
     if algo == "ppo":
-        # env.observation_space 是带 batch 维（num_envs）的空间，取形状时去掉第一维
-        single_obs = env.observation_space["policy"]
-        observation_space = {
-            "state": single_obs["state"].shape[-1],
-            "lidar": single_obs["lidar"].shape[1:],
-            "dynamic_obstacle": single_obs["dynamic_obstacle"].shape[1:],
-        }
+        observation_space = navigation_observation_shapes(env)
         return PPO(
             cfg=cfg,
             observation_space=observation_space,
@@ -307,18 +301,20 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
     for _ in range(cfg.training_frame_num):
         action_td = agent.act(obs_td.clone())
 
-        # nav 环境只接收动作 tensor（不是 TensorDict）
+        # (N, 3) 机体系实际速度；坐标旋转由环境 Action 完成。
         next_obs, reward, terminated, truncated, _ = env.step(action_td["agents", "action"])
         next_obs_td = obs_to_tensordict(next_obs, env.unwrapped.num_envs, env.unwrapped.device)
 
         reward = reward.reshape(env.unwrapped.num_envs, 1)
-        terminated = terminated.reshape(env.unwrapped.num_envs, 1)
-        truncated = truncated.reshape(env.unwrapped.num_envs, 1)
+        terminated = terminated.reshape(env.unwrapped.num_envs, 1).bool()
+        truncated = truncated.reshape(env.unwrapped.num_envs, 1).bool()
         done = terminated | truncated
         completed_returns = return_tracker.update(reward, done)
         env_statistics.update(done, completed_returns)
         reward_component_statistics.update()
 
+        # done 环境的 next_obs 已是新回合初始观测。当前 PPO 对包括超时在内的
+        # done 均屏蔽 next_value，不使用该观测跨回合自举。
         next_observation = next_obs_td["agents", "observation"].detach().clone()
         current_observation = action_td["agents", "observation"].detach().clone()
         action_normalized = action_td["agents", "action_normalized"].detach().clone()
@@ -362,6 +358,7 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
 
         obs_td = next_obs_td
 
+    # (N, T) batch；state/goal/depth 分别保留 (9,)/(4,)/(1,54,96)。
     rollout = torch.stack(frames, dim=1)
     env_log = env_statistics.metrics()
     env_log.update(reward_component_statistics.metrics())
