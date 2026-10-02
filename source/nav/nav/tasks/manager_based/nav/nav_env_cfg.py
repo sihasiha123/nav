@@ -1,5 +1,3 @@
-import math
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import (
     ArticulationCfg,
@@ -88,7 +86,7 @@ class NavSceneCfg(InteractiveSceneCfg):
         obstacle_height_range=(1.0, 2.5),
     )
 
-    # 前视深度相机：96 x 54，水平视场 120°，深度上限 4m。
+    # 前视深度相机：96 x 54，水平视场 90°，深度上限 4m。
     # 固定在 body 上并跟随完整姿态，查询共享地形与每个独立运动的障碍物。
     depth_camera: MultiMeshRayCasterCameraCfg = MultiMeshRayCasterCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/body",
@@ -104,8 +102,7 @@ class NavSceneCfg(InteractiveSceneCfg):
             width=96,
             height=54,
             focal_length=1.0,
-            # horizontal_aperture = 2 * focal_length * tan(horizontal_fov / 2)
-            horizontal_aperture=2.0 * math.tan(math.radians(120.0 / 2.0)),
+            horizontal_aperture=2.0,
         ),
         data_types=["distance_to_image_plane"],
         max_distance=4.0,
