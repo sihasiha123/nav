@@ -183,8 +183,9 @@ class RolloutRewardComponentStatistics:
 
 
 def collect_algo_log_items(train_info, rollout):
+    transitions = rollout["transitions"]
     return {
-        "Rollout_Reward/step_mean": to_float(rollout["next", "agents", "reward"]),
+        "Rollout_Reward/step_mean": to_float(transitions["next", "agents", "reward"]),
         "Loss/actor": to_float(train_info["actor_loss"]),
         "Loss/critic": to_float(train_info["critic_loss"]),
         "Policy/entropy": to_float(train_info["entropy"]),
@@ -300,8 +301,29 @@ def attach_history(obs_td, history):
     return obs_td
 
 
+def base_observation(obs):
+    """只保留环境原始单帧观测，不把滑动窗口写入 transition。"""
+    return {
+        key: value.detach().clone()
+        for key, value in obs.items()
+        if key in ("state", "goal", "depth")
+    }
+
+
 def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer):
     frames = []
+    prefix = {
+        key: value.detach().clone()
+        for key, value in history_buffer.snapshot().items()
+    }
+    sequence_parts = {
+        "state": [prefix["state"]],
+        "goal": [prefix["goal"]],
+        "depth": [prefix["depth"]],
+        "action": [prefix["action"]],
+        "valid": [prefix["valid"]],
+        "episode_id": [prefix["episode_id"]],
+    }
     env_statistics = RolloutEnvStatistics(env.unwrapped)
     reward_component_statistics = RolloutRewardComponentStatistics(env.unwrapped)
 
@@ -322,7 +344,7 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
 
         # done 环境的 next_obs 已是新回合初始观测。当前 PPO 对包括超时在内的
         # done 均屏蔽 next_value，不使用该观测跨回合自举。
-        current_observation = action_td["agents", "observation"].detach().clone()
+        current_observation = base_observation(action_td["agents", "observation"])
         action_normalized = action_td["agents", "action_normalized"].detach().clone()
 
         history_buffer.reset(done)
@@ -332,8 +354,11 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
             next_obs_td["agents", "observation"],
             previous_action=previous_action,
         )
+        next_snapshot = history_buffer.snapshot()
+        for key in sequence_parts:
+            sequence_parts[key].append(next_snapshot[key][:, -1:].detach().clone())
         attach_history(next_obs_td, history_buffer.window())
-        next_observation = next_obs_td["agents", "observation"].detach().clone()
+        next_observation = base_observation(next_obs_td["agents", "observation"])
 
         next_data = TensorDict(
             {
@@ -374,8 +399,16 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
 
         obs_td = next_obs_td
 
-    # (N, T) batch；历史窗口随每个 transition 一起保存。
-    rollout = torch.stack(frames, dim=1)
+    transitions = torch.stack(frames, dim=1)
+    history = {
+        "sequence_state": torch.cat(sequence_parts["state"], dim=1),
+        "sequence_goal": torch.cat(sequence_parts["goal"], dim=1),
+        "sequence_depth": torch.cat(sequence_parts["depth"], dim=1),
+        "sequence_action": torch.cat(sequence_parts["action"], dim=1),
+        "sequence_valid": torch.cat(sequence_parts["valid"], dim=1),
+        "sequence_episode_id": torch.cat(sequence_parts["episode_id"], dim=1),
+    }
+    rollout = {"transitions": transitions, "history": history}
     env_log = env_statistics.metrics()
     env_log.update(reward_component_statistics.metrics())
     return rollout, obs_td, env_log

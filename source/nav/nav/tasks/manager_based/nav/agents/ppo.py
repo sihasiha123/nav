@@ -96,17 +96,15 @@ def compute_gae(reward, done, value, next_value, gamma, lam):
 
 
 def make_minibatches(rollout, num_minibatches):
-    """把 rollout 打乱切成 minibatch。"""
-    rollout = rollout.reshape(-1)
-
-    batch_size = rollout.shape[0]
+    """按 rollout 原始顺序切分 minibatch，不打乱时序 transition。"""
+    batch_size = rollout.batch_size.numel()
     usable_size = batch_size // num_minibatches * num_minibatches
     minibatch_size = usable_size // num_minibatches
-    indices = torch.randperm(usable_size, device=rollout.device)
+    indices = torch.arange(usable_size, device=rollout.device)
 
     for start in range(0, usable_size, minibatch_size):
         batch_indices = indices[start : start + minibatch_size]
-        yield rollout[batch_indices]
+        yield batch_indices
 
 
 class PPO(nn.Module):
@@ -186,16 +184,20 @@ class PPO(nn.Module):
 
     def update(self, rollout):
         """用 rollout 更新网络，返回 loss 指标。"""
+        transitions = rollout["transitions"]
+        transition_flat = transitions.reshape(-1)
         with torch.no_grad():
-            next_obs = rollout["next", "agents", "observation"]
-            next_obs = self._flatten_observation(next_obs)
+            indices = torch.arange(transition_flat.batch_size[0], device=self.device)
+            next_obs = self._make_temporal_observation(
+                rollout["history"], transition_flat, indices, next=True
+            )
             next_feature = self._feature_in_chunks(next_obs)
-            next_value = self.critic(next_feature).reshape_as(rollout["state_value"])
+            next_value = self.critic(next_feature).reshape_as(transitions["state_value"])
 
-        reward = rollout["next", "agents", "reward"]
+        reward = transitions["next", "agents", "reward"]
         # 成功、碰撞、越界和超时都会结束回合；用组合 done 防止跨回合自举。
-        done = rollout["next", "done"]
-        value = rollout["state_value"]
+        done = transitions["next", "done"]
+        value = transitions["state_value"]
         value = self.value_norm.denormalize(value)
         next_value = self.value_norm.denormalize(next_value)
 
@@ -211,21 +213,25 @@ class PPO(nn.Module):
         self.value_norm.update(returns)
         returns = self.value_norm.normalize(returns)
 
-        rollout["advantage"] = advantage
-        rollout["return"] = returns
+        transitions["advantage"] = advantage
+        transitions["return"] = returns
+        transition_flat = transitions.reshape(-1)
 
         infos = []
         for _ in range(self.cfg.training_epoch_num):
-            for minibatch in make_minibatches(rollout, self.cfg.num_minibatches):
-                infos.append(self._update_minibatch(minibatch))
+            for indices in make_minibatches(transitions, self.cfg.num_minibatches):
+                infos.append(self._update_minibatch(rollout, transition_flat, indices))
 
         return {
             key: torch.stack([info[key] for info in infos]).mean().item()
             for key in infos[0]
         }
 
-    def _update_minibatch(self, batch):
-        obs = batch["agents", "observation"]
+    def _update_minibatch(self, rollout, transition_flat, indices):
+        batch = transition_flat[indices]
+        obs = self._make_temporal_observation(
+            rollout["history"], transition_flat, indices, next=False
+        )
         action_normalized = batch["agents", "action_normalized"]
         old_log_prob = batch["sample_log_prob"]
         old_value = batch["state_value"].detach()
@@ -331,6 +337,42 @@ class PPO(nn.Module):
         log_prob 和 PPO 更新始终使用映射前的 action_normalized。
         """
         return (2.0 * action_normalized - 1.0) * self.action_limit
+
+    def _make_temporal_observation(self, history, transitions, indices, next):
+        """按 transition 索引从共享原始序列构造滑动历史窗口。"""
+        rollout_length = transitions.batch_size[0] // history["sequence_episode_id"].shape[0]
+        env_index = indices // rollout_length
+        time_index = indices % rollout_length
+        prefix_length = history["sequence_depth"].shape[1] - rollout_length
+        center = prefix_length - 1 + time_index + int(next)
+        history_length = int(getattr(self.cfg.feature_extractor, "history_length", 6))
+        history_stride = int(getattr(self.cfg.feature_extractor, "history_stride", 6))
+        offsets = torch.arange(history_length - 1, -1, -1, device=self.device) * history_stride
+        positions = center.unsqueeze(1) - offsets.unsqueeze(0)
+
+        sequence_episode_id = history["sequence_episode_id"]
+        current_episode_id = sequence_episode_id[env_index, center]
+        valid = history["sequence_valid"][env_index[:, None], positions]
+        valid &= sequence_episode_id[env_index[:, None], positions] == current_episode_id[:, None]
+
+        state = history["sequence_state"][env_index[:, None], positions]
+        depth = history["sequence_depth"][env_index[:, None], positions]
+        action = history["sequence_action"][env_index[:, None], positions]
+        goal_source = (
+            transitions["next", "agents", "observation", "goal"]
+            if next
+            else transitions["agents", "observation", "goal"]
+        )
+        goal = goal_source[indices]
+        age = offsets.to(torch.float32).unsqueeze(0).expand(indices.shape[0], -1) / 60.0
+        return {
+            "depth_history": depth,
+            "state_history": state,
+            "action_history": action,
+            "age_seconds": age,
+            "valid_mask": valid,
+            "current_goal": goal,
+        }
 
     def _flatten_observation(self, obs):
         """合并 rollout 的 (N, T)，保留历史窗口维度。"""

@@ -20,6 +20,7 @@ class HistoryBuffer:
         self._depth = None
         self._action = None
         self._count = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self._episode_id = torch.zeros(num_envs, dtype=torch.long, device=device)
 
     def _allocate(self, obs):
         self._state = torch.zeros(
@@ -36,9 +37,11 @@ class HistoryBuffer:
     def reset(self, mask=None):
         if mask is None:
             self._count.zero_()
+            self._episode_id.zero_()
         else:
             mask = mask.reshape(-1).bool()
             self._count[mask] = 0
+            self._episode_id[mask] += 1
 
     def append(self, obs, previous_action=None):
         if self._state is None:
@@ -79,4 +82,20 @@ class HistoryBuffer:
             "age_seconds": age,
             "valid_mask": valid,
             "current_goal": goal[:, -1],
+        }
+
+    def snapshot(self):
+        """返回当前共享原始缓存，不复制成每个 transition 的窗口。"""
+        if self._state is None:
+            raise RuntimeError("HistoryBuffer must receive an observation before snapshot().")
+        positions = torch.arange(self.capacity, device=self.device).unsqueeze(0)
+        valid = positions >= (self.capacity - self._count).unsqueeze(1)
+        episode_id = self._episode_id.unsqueeze(1).expand(-1, self.capacity)
+        return {
+            "state": self._state,
+            "goal": self._goal,
+            "depth": self._depth,
+            "action": self._action,
+            "valid": valid,
+            "episode_id": episode_id,
         }
