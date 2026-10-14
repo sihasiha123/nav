@@ -301,15 +301,6 @@ def attach_history(obs_td, history):
     return obs_td
 
 
-def base_observation(obs):
-    """只保留环境原始单帧观测，不把滑动窗口写入 transition。"""
-    return {
-        key: value.detach().clone()
-        for key, value in obs.items()
-        if key in ("state", "goal", "depth")
-    }
-
-
 def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer):
     frames = []
     prefix = {
@@ -344,7 +335,6 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
 
         # done 环境的 next_obs 已是新回合初始观测。当前 PPO 对包括超时在内的
         # done 均屏蔽 next_value，不使用该观测跨回合自举。
-        current_observation = base_observation(action_td["agents", "observation"])
         action_normalized = action_td["agents", "action_normalized"].detach().clone()
 
         history_buffer.reset(done)
@@ -358,13 +348,10 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
         for key in sequence_parts:
             sequence_parts[key].append(next_snapshot[key][:, -1:].detach().clone())
         attach_history(next_obs_td, history_buffer.window())
-        next_observation = base_observation(next_obs_td["agents", "observation"])
-
         next_data = TensorDict(
             {
                 "agents": TensorDict(
                     {
-                        "observation": next_observation,
                         "reward": reward.detach().clone(),
                     },
                     batch_size=[env.unwrapped.num_envs],
@@ -382,7 +369,6 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
             {
                 "agents": TensorDict(
                     {
-                        "observation": current_observation,
                         "action_normalized": action_normalized,
                     },
                     batch_size=[env.unwrapped.num_envs],

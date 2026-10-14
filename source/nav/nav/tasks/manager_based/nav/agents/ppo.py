@@ -96,11 +96,11 @@ def compute_gae(reward, done, value, next_value, gamma, lam):
 
 
 def make_minibatches(rollout, num_minibatches):
-    """按 rollout 原始顺序切分 minibatch，不打乱时序 transition。"""
+    """随机打乱 transition 窗口索引，但不改变窗口内部的时间顺序。"""
     batch_size = rollout.batch_size.numel()
     usable_size = batch_size // num_minibatches * num_minibatches
     minibatch_size = usable_size // num_minibatches
-    indices = torch.arange(usable_size, device=rollout.device)
+    indices = torch.randperm(usable_size, device=rollout.device)
 
     for start in range(0, usable_size, minibatch_size):
         batch_indices = indices[start : start + minibatch_size]
@@ -187,12 +187,9 @@ class PPO(nn.Module):
         transitions = rollout["transitions"]
         transition_flat = transitions.reshape(-1)
         with torch.no_grad():
-            indices = torch.arange(transition_flat.batch_size[0], device=self.device)
-            next_obs = self._make_temporal_observation(
-                rollout["history"], transition_flat, indices, next=True
-            )
-            next_feature = self._feature_in_chunks(next_obs)
-            next_value = self.critic(next_feature).reshape_as(transitions["state_value"])
+            next_value = self._next_values_in_chunks(
+                rollout["history"], transition_flat, chunk_size=256
+            ).reshape_as(transitions["state_value"])
 
         reward = transitions["next", "agents", "reward"]
         # 成功、碰撞、越界和超时都会结束回合；用组合 done 防止跨回合自举。
@@ -358,12 +355,7 @@ class PPO(nn.Module):
         state = history["sequence_state"][env_index[:, None], positions]
         depth = history["sequence_depth"][env_index[:, None], positions]
         action = history["sequence_action"][env_index[:, None], positions]
-        goal_source = (
-            transitions["next", "agents", "observation", "goal"]
-            if next
-            else transitions["agents", "observation", "goal"]
-        )
-        goal = goal_source[indices]
+        goal = history["sequence_goal"][env_index, center]
         age = offsets.to(torch.float32).unsqueeze(0).expand(indices.shape[0], -1) / 60.0
         return {
             "depth_history": depth,
@@ -381,14 +373,13 @@ class PPO(nn.Module):
             for key, value in obs.items()
         }
 
-    def _feature_in_chunks(self, obs, chunk_size=256):
-        """分块编码大批量历史观测，避免 next value 峰值显存过高。"""
-        batch_size = next(iter(obs.values())).shape[0]
+    def _next_values_in_chunks(self, history, transitions, chunk_size=256):
+        """按索引分块构造 next 窗口，避免一次性 materialize 整个 rollout。"""
+        indices = torch.arange(transitions.batch_size[0], device=self.device)
         features = []
-        for start in range(0, batch_size, chunk_size):
-            chunk = {
-                key: value[start : start + chunk_size]
-                for key, value in obs.items()
-            }
-            features.append(self.feature_extractor(chunk))
+        for index_chunk in indices.split(chunk_size):
+            obs = self._make_temporal_observation(
+                history, transitions, index_chunk, next=True
+            )
+            features.append(self.critic(self.feature_extractor(obs)))
         return torch.cat(features, dim=0)
