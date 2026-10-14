@@ -3,17 +3,19 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""自定义 PPO：状态/目标 MLP、深度 CNN、机体系 Beta 速度动作与 ValueNorm。"""
+"""自定义 PPO：CNN 时序编码、机体系 Beta 速度动作与 ValueNorm。"""
 
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .common import ValueNorm
+from .temporal_encoder import TemporalFeatureExtractor
 
 __all__ = [
     "PPO",
@@ -25,55 +27,10 @@ __all__ = [
 ]
 
 
-class PPOFeatureExtractor(nn.Module):
-    """三个观测分支融合为 (B, 256)，由 Actor 和 Critic 共享。
+class PPOFeatureExtractor(TemporalFeatureExtractor):
+    """Actor 和 Critic 共享的 CNN + Transformer 时序编码器。"""
 
-    state: (B, 9)，goal: (B, 4)，depth: (B, 1, H, W)。
-    深度已由环境归一化为 [0, 1]，此处不再缩放。
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        self.state_encoder = nn.Sequential(
-            nn.Linear(9, 64),
-            nn.ELU(),
-            nn.Linear(64, 64),
-            nn.ELU(),
-        )
-        self.goal_encoder = nn.Sequential(
-            nn.Linear(4, 32),
-            nn.ELU(),
-            nn.Linear(32, 32),
-            nn.ELU(),
-        )
-
-        # 当前 54x96 图像依次变为 27x48、14x24、7x12。
-        self.depth_encoder = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),
-            nn.ELU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.ELU(),
-            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),
-            nn.ELU(),
-            nn.Flatten(),
-            nn.LazyLinear(128),
-            nn.LayerNorm(128),
-        )
-
-        self.feature_fusion = nn.Sequential(
-            nn.Linear(64 + 32 + 128, 256),
-            nn.ELU(),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
-        )
-
-    def forward(self, obs):
-        state_feature = self.state_encoder(obs["state"])
-        goal_feature = self.goal_encoder(obs["goal"])
-        depth_feature = self.depth_encoder(obs["depth"])
-        feature = torch.cat([state_feature, goal_feature, depth_feature], dim=-1)
-        return self.feature_fusion(feature)
+    pass
 
 
 class PPOActor(nn.Module):
@@ -167,7 +124,12 @@ class PPO(nn.Module):
         if not math.isfinite(self.action_limit) or self.action_limit <= 0.0:
             raise ValueError("actor.action_limit must be a finite, positive per-axis speed in m/s.")
 
-        self.feature_extractor = PPOFeatureExtractor().to(device)
+        feature_cfg = getattr(cfg, "feature_extractor", SimpleNamespace())
+        self.feature_extractor = PPOFeatureExtractor(
+            token_dim=getattr(feature_cfg, "token_dim", 128),
+            num_heads=getattr(feature_cfg, "num_heads", 4),
+            tau=getattr(feature_cfg, "time_decay_tau", 0.5),
+        ).to(device)
         self.actor = PPOActor(self.action_dim).to(device)
         self.critic = PPOCritic().to(device)
         self.value_norm = ValueNorm(1).to(device)
@@ -227,8 +189,8 @@ class PPO(nn.Module):
         with torch.no_grad():
             next_obs = rollout["next", "agents", "observation"]
             next_obs = self._flatten_observation(next_obs)
-            next_feature = self.feature_extractor(next_obs)
-            next_value = self.critic(next_feature).view_as(rollout["state_value"])
+            next_feature = self._feature_in_chunks(next_obs)
+            next_value = self.critic(next_feature).reshape_as(rollout["state_value"])
 
         reward = rollout["next", "agents", "reward"]
         # 成功、碰撞、越界和超时都会结束回合；用组合 done 防止跨回合自举。
@@ -349,17 +311,18 @@ class PPO(nn.Module):
         depth_shape = shapes["depth"]
         if len(depth_shape) != 3 or depth_shape[0] != 1 or any(size <= 0 for size in depth_shape):
             raise ValueError("Navigation PPO expects depth shape (1, H, W) with positive dimensions.")
-        obs = {key: torch.zeros(1, *shape, device=self.device) for key, shape in shapes.items()}
+        history_length = int(getattr(getattr(self.cfg, "feature_extractor", None), "history_length", 6))
+        obs = {
+            "depth_history": torch.zeros(1, history_length, *shapes["depth"], device=self.device),
+            "state_history": torch.zeros(1, history_length, 9, device=self.device),
+            "action_history": torch.zeros(1, history_length, 3, device=self.device),
+            "age_seconds": torch.zeros(1, history_length, device=self.device),
+            "valid_mask": torch.ones(1, history_length, dtype=torch.bool, device=self.device),
+            "current_goal": torch.zeros(1, 4, device=self.device),
+        }
         feature = self.feature_extractor(obs)
         self.actor(feature)
         self.critic(feature)
-
-    def _flatten_observation(self, obs):
-        """合并 rollout 的 (N, T)，保留状态维数和深度图的 (1, H, W)。"""
-        return {
-            key: value.reshape(-1, *value.shape[2:])
-            for key, value in obs.items()
-        }
 
     def _to_body_action(self, action_normalized):
         """Beta 样本 (B, 3) 映射为机体系 [前、左、上] 速度，单位 m/s。
@@ -368,3 +331,22 @@ class PPO(nn.Module):
         log_prob 和 PPO 更新始终使用映射前的 action_normalized。
         """
         return (2.0 * action_normalized - 1.0) * self.action_limit
+
+    def _flatten_observation(self, obs):
+        """合并 rollout 的 (N, T)，保留历史窗口维度。"""
+        return {
+            key: value.reshape(-1, *value.shape[2:])
+            for key, value in obs.items()
+        }
+
+    def _feature_in_chunks(self, obs, chunk_size=256):
+        """分块编码大批量历史观测，避免 next value 峰值显存过高。"""
+        batch_size = next(iter(obs.values())).shape[0]
+        features = []
+        for start in range(0, batch_size, chunk_size):
+            chunk = {
+                key: value[start : start + chunk_size]
+                for key, value in obs.items()
+            }
+            features.append(self.feature_extractor(chunk))
+        return torch.cat(features, dim=0)
