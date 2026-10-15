@@ -1,7 +1,7 @@
 algo:
   feature_extractor:
     learning_rate: 0.0005
-    history_length: 6
+    history_length: 4
     history_stride: 6
     token_dim: 128
     num_heads: 4
