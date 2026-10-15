@@ -6,6 +6,7 @@ algo:
     token_dim: 128
     num_heads: 4
     time_decay_tau: 0.5
+    use_time_decay_bias: false # D: remove temporal decay bias, keep the full temporal model
 
   actor:
     learning_rate: 0.0005

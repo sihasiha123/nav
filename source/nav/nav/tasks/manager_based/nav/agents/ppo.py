@@ -127,6 +127,7 @@ class PPO(nn.Module):
             token_dim=getattr(feature_cfg, "token_dim", 128),
             num_heads=getattr(feature_cfg, "num_heads", 4),
             tau=getattr(feature_cfg, "time_decay_tau", 0.5),
+            use_time_decay_bias=getattr(feature_cfg, "use_time_decay_bias", True),
         ).to(device)
         self.actor = PPOActor(self.action_dim).to(device)
         self.critic = PPOCritic().to(device)

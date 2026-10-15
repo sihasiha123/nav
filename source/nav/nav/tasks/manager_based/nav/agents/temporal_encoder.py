@@ -20,10 +20,11 @@ class ConvBlock(nn.Module):
 class TemporalFeatureExtractor(nn.Module):
     """每帧 CNN 编码后，用当前决策 query 读取历史 token。"""
 
-    def __init__(self, token_dim=128, num_heads=4, tau=0.5):
+    def __init__(self, token_dim=128, num_heads=4, tau=0.5, use_time_decay_bias=True):
         super().__init__()
         self.token_dim = token_dim
         self.tau = tau
+        self.use_time_decay_bias = use_time_decay_bias
         self.depth_encoder = nn.Sequential(
             ConvBlock(1, 16, 2),
             ConvBlock(16, 32, 2),
@@ -86,16 +87,16 @@ class TemporalFeatureExtractor(nn.Module):
             torch.cat((current_visual, current_state, current_action, goal), dim=-1)
         ).unsqueeze(1)
         key_padding_mask = ~token_valid
-        attention_bias = (-age / self.tau).repeat_interleave(7, dim=1)
-        attention_bias = attention_bias[:, None, None, :].expand(
-            -1, self.num_heads, 1, -1
-        )
-
         q = self.query(query).reshape(-1, 1, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.key(history_tokens).reshape(-1, history_tokens.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
         v = self.value(history_tokens).reshape(-1, history_tokens.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
         logits = torch.matmul(q, k.transpose(-2, -1)) / self.head_dim**0.5
-        logits = logits + attention_bias
+        if self.use_time_decay_bias:
+            attention_bias = (-age / self.tau).repeat_interleave(7, dim=1)
+            attention_bias = attention_bias[:, None, None, :].expand(
+                -1, self.num_heads, 1, -1
+            )
+            logits = logits + attention_bias
         logits = logits.masked_fill(key_padding_mask[:, None, None, :], torch.finfo(logits.dtype).min)
         weights = torch.softmax(logits, dim=-1)
         attended = torch.matmul(weights, v).transpose(1, 2).reshape(-1, 1, self.token_dim)
