@@ -1,135 +1,192 @@
-# Template for Isaac Lab Projects
+# Isaac Lab 无人机导航项目
 
-## Overview
+## 项目简介
 
-This project/repository serves as a template for building projects or extensions based on Isaac Lab.
-It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
+本项目是一个基于 Isaac Lab `ManagerBasedRLEnv` 构建的无人机导航强化学习项目。项目代码独立于 Isaac Lab 主仓库，包含无人机资产、速度控制器、导航任务 MDP、PPO 算法以及训练和评估脚本。
 
-**Key Features:**
+当前注册的任务为：
 
-- `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
-- `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
+```text
+Template-Nav-v0
+```
 
-**Keywords:** extension, template, isaaclab
+主要目录：
 
-## Installation
+```text
+source/nav/nav/assets/                         机器人和动态障碍物资产
+source/nav/nav/controllers/                    无人机控制器
+source/nav/nav/tasks/manager_based/nav/        导航环境和 MDP 配置
+source/nav/nav/tasks/manager_based/nav/agents/ PPO 算法及其配置
+scripts/                                       训练、评估和环境测试脚本
+```
 
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda or uv installation as it simplifies calling Python scripts from the terminal.
+## 环境安装
 
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
+1. 按照 [Isaac Lab 安装文档](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html) 安装 Isaac Lab。推荐使用 Conda 或 uv 环境，以便直接从终端运行 Python 脚本。
 
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
+2. 将本项目放在 Isaac Lab 主仓库之外，例如：
 
-    ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/nav
+   ```text
+   /home/robot/IsaacLab
+   /home/robot/nav
+   ```
 
-- Verify that the extension is correctly installed by:
+3. 使用安装了 Isaac Lab 的 Python 解释器，以可编辑模式安装本项目：
 
-    - Listing the available tasks:
+   ```bash
+   python -m pip install -e source/nav
+   ```
 
-        Note: It the task name changes, it may be necessary to update the search pattern `"Template-"`
-        (in the `scripts/list_envs.py` file) so that it can be listed.
+   如果 Isaac Lab 没有安装到当前 Python 环境，请通过 `isaaclab.sh` 执行：
 
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/list_envs.py
-        ```
+   ```bash
+   /path/to/IsaacLab/isaaclab.sh -p -m pip install -e source/nav
+   ```
 
-    - Running a task:
+## 验证安装
 
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
+列出本项目注册的任务：
 
-    - Running a task with dummy agents:
+```bash
+python scripts/list_envs.py
+```
 
-        These include dummy agents that output zero or random agents. They are useful to ensure that the environments are configured correctly.
+如果当前 Python 环境无法直接导入 Isaac Lab，可以使用：
 
-        - Zero-action agent
+```bash
+/path/to/IsaacLab/isaaclab.sh -p scripts/list_envs.py
+```
 
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/zero_agent.py --task=<TASK_NAME>
-            ```
-        - Random-action agent
+## 运行环境
 
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/random_agent.py --task=<TASK_NAME>
-            ```
+使用零动作检查环境能否正常创建和运行：
 
-### Set up IDE (Optional)
+```bash
+python scripts/zero_agent.py --task Template-Nav-v0
+```
 
-To setup the IDE, please follow these instructions:
+使用随机动作检查观测、动作和 reset 流程：
 
-- Run VSCode Tasks, by pressing `Ctrl+Shift+P`, selecting `Tasks: Run Task` and running the `setup_python_env` in the drop down menu.
-  When running this task, you will be prompted to add the absolute path to your Isaac Sim installation.
+```bash
+python scripts/random_agent.py --task Template-Nav-v0
+```
 
-If everything executes correctly, it should create a file .python.env in the `.vscode` directory.
-The file contains the python paths to all the extensions provided by Isaac Sim and Omniverse.
-This helps in indexing all the python modules for intelligent suggestions while writing code.
+测试无人机动力学和控制器：
 
-### Setup as Omniverse Extension (Optional)
+```bash
+python scripts/test_drone_dynamics.py
+```
 
-We provide an example UI extension that will load upon enabling your extension defined in `source/nav/nav/ui_extension_example.py`.
+## 训练
 
-To enable your extension, follow these steps:
+启动 PPO 训练：
 
-1. **Add the search path of this project/repository** to the extension manager:
-    - Navigate to the extension manager using `Window` -> `Extensions`.
-    - Click on the **Hamburger Icon**, then go to `Settings`.
-    - In the `Extension Search Paths`, enter the absolute path to the `source` directory of this project/repository.
-    - If not already present, in the `Extension Search Paths`, enter the path that leads to Isaac Lab's extension directory directory (`IsaacLab/source`)
-    - Click on the **Hamburger Icon**, then click `Refresh`.
+```bash
+python scripts/train.py --task Template-Nav-v0 --algo ppo
+```
 
-2. **Search and enable your extension**:
-    - Find your extension under the `Third Party` category.
-    - Toggle it to enable your extension.
+常用参数：
 
-## Code formatting
+```text
+--num_envs        并行环境数量
+--seed            随机种子
+--max_iterations  最大训练迭代次数
+--save_interval   模型保存间隔
+--log_dir         训练日志目录
+--headless        无界面运行
+```
 
-We have a pre-commit template to automatically format your code.
-To install pre-commit:
+示例：
+
+```bash
+python scripts/train.py \
+    --task Template-Nav-v0 \
+    --algo ppo \
+    --num_envs 1024 \
+    --max_iterations 2000 \
+    --headless
+```
+
+训练结果默认保存在项目根目录的 `runs/` 中。Weights & Biases 当前使用离线模式，训练完成后可执行日志中给出的 `wandb sync` 命令上传数据。
+
+## 评估
+
+使用训练生成的模型进行评估：
+
+```bash
+python scripts/eval.py --task Template-Nav-v0 --checkpoint <模型路径>
+```
+
+具体参数可通过以下命令查看：
+
+```bash
+python scripts/eval.py --help
+```
+
+## VS Code 配置（可选）
+
+1. 按 `Ctrl+Shift+P` 打开命令面板。
+2. 选择 `Tasks: Run Task`。
+3. 运行 `setup_python_env`。
+4. 根据提示输入 Isaac Sim 的绝对路径。
+
+任务执行成功后，`.vscode` 目录中会生成 `.python.env`。该文件包含 Isaac Sim、Omniverse 和 Isaac Lab 扩展的 Python 路径，可用于代码补全和模块索引。
+
+## 作为 Omniverse 扩展加载（可选）
+
+项目提供了示例扩展入口：
+
+```text
+source/nav/nav/ui_extension_example.py
+```
+
+加载步骤：
+
+1. 在 Omniverse 中打开 `Window` -> `Extensions`。
+2. 打开扩展管理器设置。
+3. 将本项目 `source` 目录的绝对路径加入 `Extension Search Paths`。
+4. 确保 Isaac Lab 的 `source` 目录也位于搜索路径中。
+5. 刷新扩展列表。
+6. 在 `Third Party` 分类中找到并启用本项目扩展。
+
+## 代码格式化
+
+安装 `pre-commit`：
 
 ```bash
 pip install pre-commit
 ```
 
-Then you can run pre-commit with:
+检查并格式化所有文件：
 
 ```bash
 pre-commit run --all-files
 ```
 
-## Troubleshooting
+## 常见问题
 
-### Pylance Missing Indexing of Extensions
+### Pylance 无法索引扩展
 
-In some VsCode versions, the indexing of part of the extensions is missing.
-In this case, add the path to your extension in `.vscode/settings.json` under the key `"python.analysis.extraPaths"`.
+如果 Pylance 无法找到 Isaac Lab 或项目模块，请在 `.vscode/settings.json` 的 `python.analysis.extraPaths` 中加入项目和 Isaac Lab 的 Python 路径：
 
 ```json
 {
     "python.analysis.extraPaths": [
-        "<path-to-ext-repo>/source/nav"
+        "/path/to/nav/source/nav",
+        "/path/to/IsaacLab/source/isaaclab",
+        "/path/to/IsaacLab/source/isaaclab_tasks"
     ]
 }
 ```
 
-### Pylance Crash
+### Pylance 占用内存过高或崩溃
 
-If you encounter a crash in `pylance`, it is probable that too many files are indexed and you run out of memory.
-A possible solution is to exclude some of omniverse packages that are not used in your project.
-To do so, modify `.vscode/settings.json` and comment out packages under the key `"python.analysis.extraPaths"`
-Some examples of packages that can likely be excluded are:
+Isaac Sim 和 Omniverse 包含大量扩展。若 Pylance 因索引内容过多而占用大量内存，可从 `python.analysis.extraPaths` 中移除当前项目不使用的包，例如动画、Kit UI、Graph UI 和服务类扩展。
 
-```json
-"<path-to-isaac-sim>/extscache/omni.anim.*"         // Animation packages
-"<path-to-isaac-sim>/extscache/omni.kit.*"          // Kit UI tools
-"<path-to-isaac-sim>/extscache/omni.graph.*"        // Graph UI tools
-"<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
-...
-```
+### 无法导入 Isaac Lab 模块
+
+如果出现 `ModuleNotFoundError: No module named 'isaaclab'` 或类似错误，请确认：
+
+- 当前 Python 解释器属于 Isaac Lab 安装环境；
+- 本项目已通过 `pip install -e source/nav` 安装；
+- 或者使用 `/path/to/IsaacLab/isaaclab.sh -p <script>` 启动脚本。

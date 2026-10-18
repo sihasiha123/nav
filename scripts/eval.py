@@ -44,7 +44,8 @@ import torch  # noqa: E402
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: E402
 
 import nav.tasks  # noqa: F401, E402
-from nav.tasks.manager_based.nav.agents.common import obs_to_tensordict  # noqa: E402
+from nav.tasks.manager_based.nav.agents.common import navigation_observation_shapes, obs_to_tensordict  # noqa: E402
+from nav.tasks.manager_based.nav.agents.history_buffer import HistoryBuffer  # noqa: E402
 from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
 
 
@@ -62,12 +63,7 @@ def load_agent_cfg(task_name, entry_point_key):
 
 
 def make_agent(cfg, env):
-    single_obs = env.observation_space["policy"]
-    observation_space = {
-        "state": single_obs["state"].shape[-1],
-        "lidar": single_obs["lidar"].shape[1:],
-        "dynamic_obstacle": single_obs["dynamic_obstacle"].shape[1:],
-    }
+    observation_space = navigation_observation_shapes(env)
     return PPO(
         cfg=cfg,
         observation_space=observation_space,
@@ -77,10 +73,10 @@ def make_agent(cfg, env):
 
 
 def get_term_mask(env, term_name):
-    try:
-        term = env.termination_manager.get_term(term_name)
-    except (KeyError, RuntimeError):
+    manager = env.termination_manager
+    if term_name == "dynamic_collision" and term_name not in manager.active_terms:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    term = manager.get_term(term_name)
     return term.reshape(-1).bool()
 
 
@@ -126,6 +122,16 @@ def evaluate(env, agent, episodes_per_env, step_dt, stochastic=False):
 
     obs = env.reset()
     obs_td = obs_to_tensordict(obs, num_envs, device)
+    history_buffer = HistoryBuffer(
+        num_envs,
+        device,
+        history_length=agent.cfg.feature_extractor.history_length,
+        history_stride=agent.cfg.feature_extractor.history_stride,
+        action_limit=agent.action_limit,
+    )
+    history_buffer.append(obs_td["agents", "observation"])
+    for key, value in history_buffer.window().items():
+        obs_td["agents", "observation", key] = value
     max_episode_length = int(getattr(env.unwrapped, "max_episode_length", 0))
     if max_episode_length <= 0:
         episode_length_s = float(getattr(env.unwrapped.cfg, "episode_length_s", 60.0))
@@ -140,11 +146,23 @@ def evaluate(env, agent, episodes_per_env, step_dt, stochastic=False):
             else:
                 action_td = agent.act_deterministic(obs_td)
 
+            # PPO 已输出机体系 m/s，直接交给环境，不再次变换或缩放。
             next_obs, reward, terminated, truncated, _ = env.step(action_td["agents", "action"])
             reward = reward.reshape(-1).float()
             done = (terminated.reshape(-1).bool() | truncated.reshape(-1).bool())
-            episode_returns += reward
-            episode_lengths += 1
+            next_obs_td = obs_to_tensordict(next_obs, num_envs, device)
+            history_buffer.reset(done)
+            previous_action = 2.0 * action_td["agents", "action_normalized"] - 1.0
+            previous_action[done] = 0.0
+            history_buffer.append(
+                next_obs_td["agents", "observation"],
+                previous_action=previous_action,
+            )
+            for key, value in history_buffer.window().items():
+                next_obs_td["agents", "observation", key] = value
+            active = completed < episodes_per_env
+            episode_returns[active] += reward[active]
+            episode_lengths[active] += 1
 
             reasons = classify_termination(env.unwrapped, done)
             for env_id in torch.where(done & (completed < episodes_per_env))[0].tolist():
@@ -166,7 +184,7 @@ def evaluate(env, agent, episodes_per_env, step_dt, stochastic=False):
             if torch.all(completed >= episodes_per_env):
                 break
 
-            obs_td = obs_to_tensordict(next_obs, num_envs, device)
+            obs_td = next_obs_td
         else:
             raise RuntimeError(
                 "Evaluation exceeded its step budget before every environment "
@@ -199,6 +217,8 @@ def summarize(records, checkpoint, task, seed, episodes_per_env, num_envs, step_
         "episode_count": episode_count,
         "step_dt": step_dt,
         "action_mode": "stochastic" if stochastic else "deterministic_mean",
+        "termination_statistics": "mutually_exclusive_primary_reason",
+        "termination_priority": ["static_collision", "dynamic_collision", "out_of_bounds", "success", "time_out"],
         "success_count": counts["success"],
         "success_rate": rate(counts["success"]),
         "static_collision_count": counts["static_collision"],
@@ -427,12 +447,18 @@ def main():
 
     agent_cfg = load_agent_cfg(args_cli.task, args_cli.agent)
     env = gym.make(args_cli.task, cfg=env_cfg)
-    agent = make_agent(agent_cfg, env)
-    agent.load(checkpoint)
-
-    step_dt = float(getattr(env.unwrapped, "step_dt", env_cfg.sim.dt * env_cfg.decimation))
-    output_dir = make_output_dir(args_cli.output_dir)
     try:
+        agent = make_agent(agent_cfg, env)
+        try:
+            agent.load(checkpoint)
+        except (RuntimeError, KeyError) as exc:
+            raise RuntimeError(
+                "Checkpoint could not be loaded into the state/goal/depth PPO network. "
+                "Old LiDAR checkpoints are incompatible; use a checkpoint trained with the new network. "
+                f"Original error: {exc}"
+            ) from exc
+        step_dt = float(getattr(env.unwrapped, "step_dt", env_cfg.sim.dt * env_cfg.decimation))
+        output_dir = make_output_dir(args_cli.output_dir)
         records = evaluate(
             env,
             agent,

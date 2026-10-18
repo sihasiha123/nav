@@ -1,31 +1,34 @@
-策略输出
-  (vx, vy, vz) 世界系速度指令
-        │
-        ▼
-VelocityController.apply_action()   ← 适配层
-  1. 清洗动作，限制为 (num_envs, 3)
-  2. 根据速度方向生成期望 yaw（yaw 速率限制）
-  3. 拼成命令 [yaw, vx, vy, vz]
-  4. 读取无人机当前状态（位置/姿态/线速度/角速度）
-        │
-        ▼
-LVController.compute()              ← 线速度 + 偏航环
-  1. 速度误差 → 期望加速度（限幅 max_feedback_accel）
-  2. 期望力 = mass × (acc_fb - g)
-  3. 期望推力 = 期望力转到机体 z 轴
-  4. 姿态环：由期望 yaw 和期望力方向构造期望姿态 → 期望机体角速度
-  5. 角速度环：力矩 = I × K × 角速度误差 + 陀螺耦合项
-  6. 输出 [总推力, τx, τy, τz]
-        │
-        ▼
-VelocityController 限幅
-  总推力 clamp [0, 4×最大单桨推力]
-  力矩 clamp ±最大机体力矩
-        │
-        ▼
-robot.permanent_wrench_composer.set_forces_and_torques()
-  把 [0, 0, thrust] 力和 [τx, τy, τz] 力矩施加到机身的 "body"
-        │
-        ▼
-PhysX 物理引擎积分
-  更新无人机位置、姿态、速度
+# 导航任务资产
+
+本目录配置无人机和动态障碍物。无人机的速度跟踪由 `controllers` 模块负责。
+
+## 资产配置
+
+- `quadcopter.py`：无人机 USD 路径、物理属性、初始状态和关节执行器配置。
+  - `DRONE_CFG`：启用接触传感器，未显式关闭碰撞。
+  - `DRONE_NO_COLLIDER_CFG`：关闭碰撞和接触传感器，当前导航任务使用此配置。
+- `dynamic.py`：共享动态障碍物的创建、运动参数和运行时状态。障碍物按物理步运动，不随单架无人机的回合重置。
+
+无人机配置中的 `dummy` 是作用于 `m.*` 关节的 `ImplicitActuatorCfg`，刚度和阻尼均为零。当前飞行控制通过向机身施加总推力和力矩实现，没有将导航速度指令转换成四个独立电机的转速。
+
+## 无人机控制接口
+
+控制器接收世界坐标系下的期望线速度 `[vx, vy, vz]`，单位为 m/s，张量形状为 `(num_envs, 3)`。结合无人机当前状态，控制器计算并施加总推力和机体系三轴力矩：
+
+```text
+外部提供世界系期望速度 [vx, vy, vz]
+    ↓
+VelocityController.apply_action()：接收世界系速度 [vx, vy, vz]
+    ↓
+LVController.compute()：计算总推力和机体系三轴力矩
+    ↓
+VelocityController：限幅，将力和力矩写入机身的 permanent wrench
+    ↓
+物理仿真：更新无人机位置、姿态与速度
+```
+
+`VelocityController` 读取无人机当前状态；默认根据水平速度指令生成期望偏航角，并限制偏航指令的变化速率。它将 `[yaw, vx, vy, vz]` 交给 `LVController`。
+
+`LVController` 使用世界系线速度误差计算期望力，再通过姿态环和角速度环计算机体系力矩，输出 `[总推力, τx, τy, τz]`。其中总推力还经过一阶延迟模型。
+
+速度指令的来源不属于控制器接口的职责。调用方应在调用前将指令转换为世界系速度；控制器负责速度跟踪和推力、力矩施加。

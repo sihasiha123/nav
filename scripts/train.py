@@ -40,9 +40,9 @@ from tensordict import TensorDict  # noqa: E402
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: E402
 
 import nav.tasks  # noqa: F401, E402
-from nav.tasks.manager_based.nav.agents.common import obs_to_tensordict  # noqa: E402
+from nav.tasks.manager_based.nav.agents.common import navigation_observation_shapes, obs_to_tensordict  # noqa: E402
+from nav.tasks.manager_based.nav.agents.history_buffer import HistoryBuffer  # noqa: E402
 from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
-from nav.tasks.manager_based.nav.mdp.events import get_nav_task_buffer  # noqa: E402
 
 
 WANDB_PROJECT = "nav-drone-rl"
@@ -77,7 +77,7 @@ def to_float(value):
 
 
 class RolloutEnvStatistics:
-    """统计当前 rollout 内所有 done 环境的终止原因。"""
+    """统计结束步各终止项的触发次数；同一步可计入多个项，不是互斥分类。"""
 
     def __init__(self, env):
         self._env = env
@@ -116,8 +116,8 @@ class RolloutEnvStatistics:
         denom = float(done_count)
         for term_name, term_count in self._term_counts.items():
             count = int(term_count.item())
-            metrics[f"Rollout_Termination/{term_name}_count"] = count
-            metrics[f"Rollout_Termination/{term_name}_rate"] = count / denom
+            metrics[f"Rollout_TerminationTrigger/{term_name}_count"] = count
+            metrics[f"Rollout_TerminationTrigger/{term_name}_rate"] = count / denom
         collision_count = int(self._collision_count.item())
         metrics["Rollout_Result/collision_count"] = collision_count
         metrics["Rollout_Result/collision_rate"] = collision_count / denom
@@ -156,8 +156,16 @@ class RolloutRewardComponentStatistics:
         self._component_counts = {}
 
     def update(self):
-        buffer = get_nav_task_buffer(self._env)
-        for name, component in buffer.reward_components.items():
+        # 通过 Isaac Lab 的公开 manager 接口定位奖励 term，不向环境对象注入私有引用。
+        try:
+            reward_cfg = self._env.reward_manager.get_term_cfg("navigation")
+        except (AttributeError, ValueError):
+            return
+        reward_term = getattr(reward_cfg, "func", None)
+        reward_components = getattr(reward_term, "reward_components", None)
+        if reward_components is None:
+            return
+        for name, component in reward_components.items():
             component = component.detach().float()
             if name not in self._component_sums:
                 self._component_sums[name] = torch.zeros((), dtype=torch.float32, device=self._env.device)
@@ -175,8 +183,9 @@ class RolloutRewardComponentStatistics:
 
 
 def collect_algo_log_items(train_info, rollout):
+    transitions = rollout["transitions"]
     return {
-        "Rollout_Reward/step_mean": to_float(rollout["next", "agents", "reward"]),
+        "Rollout_Reward/step_mean": to_float(transitions["next", "agents", "reward"]),
         "Loss/actor": to_float(train_info["actor_loss"]),
         "Loss/critic": to_float(train_info["critic_loss"]),
         "Policy/entropy": to_float(train_info["entropy"]),
@@ -196,10 +205,10 @@ def collect_terminal_log_items(env_log, algo_log):
     log_items["rollout/step_reward_mean"] = algo_log["Rollout_Reward/step_mean"]
 
     result_keys = {
-        "success_rate": "Rollout_Termination/success_rate",
+        "success_rate": "Rollout_TerminationTrigger/success_rate",
         "collision_rate": "Rollout_Result/collision_rate",
-        "out_of_bounds_rate": "Rollout_Termination/out_of_bounds_rate",
-        "time_out_rate": "Rollout_Termination/time_out_rate",
+        "out_of_bounds_trigger_rate": "Rollout_TerminationTrigger/out_of_bounds_rate",
+        "time_out_trigger_rate": "Rollout_TerminationTrigger/time_out_rate",
     }
     for display_name, source_name in result_keys.items():
         if source_name in env_log:
@@ -275,13 +284,7 @@ def init_wandb(run_dir, env_cfg):
 
 def make_agent(algo, cfg, env):
     if algo == "ppo":
-        # env.observation_space 是带 batch 维（num_envs）的空间，取形状时去掉第一维
-        single_obs = env.observation_space["policy"]
-        observation_space = {
-            "state": single_obs["state"].shape[-1],
-            "lidar": single_obs["lidar"].shape[1:],
-            "dynamic_obstacle": single_obs["dynamic_obstacle"].shape[1:],
-        }
+        observation_space = navigation_observation_shapes(env)
         return PPO(
             cfg=cfg,
             observation_space=observation_space,
@@ -292,35 +295,63 @@ def make_agent(algo, cfg, env):
     raise ValueError(f"Unsupported algorithm: {algo}")
 
 
-def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
+def attach_history(obs_td, history):
+    for key, value in history.items():
+        obs_td["agents", "observation", key] = value
+    return obs_td
+
+
+def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer):
     frames = []
+    prefix = {
+        key: value.detach().clone()
+        for key, value in history_buffer.snapshot().items()
+    }
+    sequence_parts = {
+        "state": [prefix["state"]],
+        "goal": [prefix["goal"]],
+        "depth": [prefix["depth"]],
+        "action": [prefix["action"]],
+        "valid": [prefix["valid"]],
+        "episode_id": [prefix["episode_id"]],
+    }
     env_statistics = RolloutEnvStatistics(env.unwrapped)
     reward_component_statistics = RolloutRewardComponentStatistics(env.unwrapped)
 
     for _ in range(cfg.training_frame_num):
         action_td = agent.act(obs_td.clone())
 
-        # nav 环境只接收动作 tensor（不是 TensorDict）
+        # (N, 3) 机体系实际速度；坐标旋转由环境 Action 完成。
         next_obs, reward, terminated, truncated, _ = env.step(action_td["agents", "action"])
         next_obs_td = obs_to_tensordict(next_obs, env.unwrapped.num_envs, env.unwrapped.device)
 
         reward = reward.reshape(env.unwrapped.num_envs, 1)
-        terminated = terminated.reshape(env.unwrapped.num_envs, 1)
-        truncated = truncated.reshape(env.unwrapped.num_envs, 1)
+        terminated = terminated.reshape(env.unwrapped.num_envs, 1).bool()
+        truncated = truncated.reshape(env.unwrapped.num_envs, 1).bool()
         done = terminated | truncated
         completed_returns = return_tracker.update(reward, done)
         env_statistics.update(done, completed_returns)
         reward_component_statistics.update()
 
-        next_observation = next_obs_td["agents", "observation"].detach().clone()
-        current_observation = action_td["agents", "observation"].detach().clone()
+        # done 环境的 next_obs 已是新回合初始观测。当前 PPO 对包括超时在内的
+        # done 均屏蔽 next_value，不使用该观测跨回合自举。
         action_normalized = action_td["agents", "action_normalized"].detach().clone()
 
+        history_buffer.reset(done)
+        previous_action = 2.0 * action_normalized - 1.0
+        previous_action[done.reshape(-1)] = 0.0
+        history_buffer.append(
+            next_obs_td["agents", "observation"],
+            previous_action=previous_action,
+        )
+        next_snapshot = history_buffer.snapshot()
+        for key in sequence_parts:
+            sequence_parts[key].append(next_snapshot[key][:, -1:].detach().clone())
+        attach_history(next_obs_td, history_buffer.window())
         next_data = TensorDict(
             {
                 "agents": TensorDict(
                     {
-                        "observation": next_observation,
                         "reward": reward.detach().clone(),
                     },
                     batch_size=[env.unwrapped.num_envs],
@@ -338,7 +369,6 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
             {
                 "agents": TensorDict(
                     {
-                        "observation": current_observation,
                         "action_normalized": action_normalized,
                     },
                     batch_size=[env.unwrapped.num_envs],
@@ -355,7 +385,16 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
 
         obs_td = next_obs_td
 
-    rollout = torch.stack(frames, dim=1)
+    transitions = torch.stack(frames, dim=1)
+    history = {
+        "sequence_state": torch.cat(sequence_parts["state"], dim=1),
+        "sequence_goal": torch.cat(sequence_parts["goal"], dim=1),
+        "sequence_depth": torch.cat(sequence_parts["depth"], dim=1),
+        "sequence_action": torch.cat(sequence_parts["action"], dim=1),
+        "sequence_valid": torch.cat(sequence_parts["valid"], dim=1),
+        "sequence_episode_id": torch.cat(sequence_parts["episode_id"], dim=1),
+    }
+    rollout = {"transitions": transitions, "history": history}
     env_log = env_statistics.metrics()
     env_log.update(reward_component_statistics.metrics())
     return rollout, obs_td, env_log
@@ -364,10 +403,21 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
 def train_ppo(env, agent, cfg, max_iterations, run_dir, save_interval, wandb_run):
     obs = env.reset()
     obs_td = obs_to_tensordict(obs, env.unwrapped.num_envs, env.unwrapped.device)
+    history_buffer = HistoryBuffer(
+        env.unwrapped.num_envs,
+        env.unwrapped.device,
+        history_length=cfg.feature_extractor.history_length,
+        history_stride=cfg.feature_extractor.history_stride,
+        action_limit=agent.action_limit,
+    )
+    history_buffer.append(obs_td["agents", "observation"])
+    attach_history(obs_td, history_buffer.window())
     return_tracker = EpisodeReturnTracker(env.unwrapped.num_envs, env.unwrapped.device)
 
     for iteration in range(max_iterations):
-        rollout, obs_td, env_log = collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker)
+        rollout, obs_td, env_log = collect_ppo_rollout(
+            env, agent, obs_td, cfg, return_tracker, history_buffer
+        )
         train_info = agent.update(rollout)
 
         algo_log = collect_algo_log_items(train_info, rollout)
@@ -377,6 +427,10 @@ def train_ppo(env, agent, cfg, max_iterations, run_dir, save_interval, wandb_run
         if env_log:
             wandb_run.log(env_log, step=iteration + 1)
         wandb_run.log(algo_log, step=iteration + 1)
+
+        # The rollout contains duplicated temporal image windows. Release it before
+        # collecting the next rollout so torch.stack does not overlap old and new data.
+        del rollout
 
         if save_interval > 0 and (iteration + 1) % save_interval == 0:
             checkpoint_path = run_dir / f"checkpoint_{iteration + 1}.pt"

@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""全局动态障碍物：运动引擎、动作项接入、场景配置生成。"""
+"""全局动态障碍物资产：生成、运动模型和运行时状态。"""
 
 from __future__ import annotations
 
@@ -14,15 +14,11 @@ import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg, RigidObjectCollection, RigidObjectCollectionCfg
-from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
-from isaaclab.envs.utils.io_descriptors import GenericActionIODescriptor
-from isaaclab.managers import ActionTerm, ActionTermCfg
+from isaaclab.envs import ManagerBasedEnv
 from isaaclab.utils import configclass
 
 __all__ = [
     "GlobalRigidObjectCollection",
-    "GlobalObstacleMotionAction",
-    "GlobalObstacleMotionActionCfg",
     "GlobalObstacleManager",
     "GlobalObstacleMotionCfg",
     "get_global_obstacle_manager",
@@ -67,7 +63,8 @@ class GlobalObstacleManager:
     它不使用机器人的 ``env_ids``，应独立于单个回合，在每个物理步中只调用一次。
     """
 
-    def __init__(self, env: ManagerBasedRLEnv, cfg: GlobalObstacleMotionCfg | None = None):
+    def __init__(self, env: ManagerBasedEnv, cfg: GlobalObstacleMotionCfg | None = None):
+        self._physics_dt = env.physics_dt
         self.cfg = (cfg or GlobalObstacleMotionCfg()).copy()
         scene_asset = env.scene[self.cfg.asset_name]
         if not isinstance(scene_asset, RigidObjectCollection):
@@ -98,6 +95,11 @@ class GlobalObstacleManager:
         self._velocity_w: torch.Tensor
         self._speed: torch.Tensor
         self._pose_w: torch.Tensor
+
+    @property
+    def physics_dt(self) -> float:
+        """运动更新使用的物理时间步。"""
+        return self._physics_dt
 
     def initialize(self) -> None:
         """初始化运动原点，并为所有障碍物采样第一个航点。"""
@@ -222,18 +224,20 @@ class GlobalObstacleManager:
 ##
 
 
-_MANAGER_ATTRIBUTE = "_nav_global_obstacle_manager"
-
-
 def get_global_obstacle_manager(
-    env: ManagerBasedRLEnv,
+    env: ManagerBasedEnv,
     cfg: GlobalObstacleMotionCfg | None = None,
 ) -> GlobalObstacleManager:
-    """返回环境的全局障碍物管理器，并在第一次使用时创建它。"""
-    manager = getattr(env, _MANAGER_ATTRIBUTE, None)
+    """返回动态障碍物资产所拥有的运动管理器。
+
+    管理器引用挂在 ``GlobalRigidObjectCollection`` 资产上，而不是注入环境
+    私有字段；这样障碍物的运行时状态和运动逻辑仍由资产领域模块负责。
+    """
+    scene_asset = env.scene[cfg.asset_name if cfg is not None else "dynamic_obstacles"]
+    manager = getattr(scene_asset, "motion_manager", None)
     if manager is None:
         manager = GlobalObstacleManager(env, cfg)
-        setattr(env, _MANAGER_ATTRIBUTE, manager)
+        setattr(scene_asset, "motion_manager", manager)
     return manager
 
 
@@ -247,84 +251,13 @@ def has_scene_entity(env: ManagerBasedEnv, asset_name: str) -> bool:
 
 
 def step_global_obstacles(
-    env: ManagerBasedRLEnv,
+    env: ManagerBasedEnv,
     dt: float | None = None,
     cfg: GlobalObstacleMotionCfg | None = None,
 ) -> None:
     """推进全局障碍物一次，应在物理仿真前调用。"""
     physics_dt = env.physics_dt if dt is None else dt
     get_global_obstacle_manager(env, cfg).step(physics_dt)
-
-
-##
-# 框架接入（动作项）
-##
-
-
-class GlobalObstacleMotionAction(ActionTerm):
-    """驱动全局动态障碍物运动的自定义动作项。
-
-    该动作项不消耗策略动作（``action_dim`` 为 0），只在每个物理步的
-    ``apply_actions()`` 中推进一次全局障碍物。障碍物不随单个机器人环境
-    重置；场景中没有障碍物集合时该动作项自动禁用。
-    """
-
-    cfg: GlobalObstacleMotionActionCfg
-    """动作项配置。"""
-
-    def __init__(self, cfg: GlobalObstacleMotionActionCfg, env: ManagerBasedEnv) -> None:
-        if not has_scene_entity(env, cfg.asset_name):
-            # 场景中没有动态障碍物集合（例如 count=0）：保持禁用，不解析实体
-            self.cfg = cfg
-            self._env = env
-            self._asset = None
-            self._IO_descriptor = GenericActionIODescriptor()
-            self._export_IO_descriptor = True
-            self._debug_vis_handle = None
-            self._enabled = False
-        else:
-            # 初始化动作项，并从场景中解析 ``cfg.asset_name`` 对应的实体
-            super().__init__(cfg, env)
-            self._enabled = True
-        # 创建空的原始/处理动作缓冲（维度为 0）
-        self._raw_actions = torch.zeros((self.num_envs, 0), device=self.device, dtype=torch.float32)
-        self._processed_actions = self._raw_actions
-
-    @property
-    def action_dim(self) -> int:
-        """该动作项不消耗策略动作维度。"""
-        return 0
-
-    @property
-    def raw_actions(self) -> torch.Tensor:
-        """原始动作缓冲，形状为 ``(num_envs, 0)``。"""
-        return self._raw_actions
-
-    @property
-    def processed_actions(self) -> torch.Tensor:
-        """处理后的动作缓冲，形状为 ``(num_envs, 0)``。"""
-        return self._processed_actions
-
-    def process_actions(self, actions: torch.Tensor) -> None:
-        """零维动作无需处理。"""
-        pass
-
-    def apply_actions(self) -> None:
-        """在每个物理步前推进一次全局障碍物。"""
-        if not self._enabled:
-            return
-        step_global_obstacles(self._env)
-
-
-@configclass
-class GlobalObstacleMotionActionCfg(ActionTermCfg):
-    """驱动全局动态障碍物运动的动作项配置。"""
-
-    class_type: type[ActionTerm] = GlobalObstacleMotionAction
-    """关联的动作项类。"""
-
-    asset_name: str = "dynamic_obstacles"
-    """场景中注册的全局动态障碍物集合名称。"""
 
 
 ##
@@ -335,9 +268,20 @@ class GlobalObstacleMotionActionCfg(ActionTermCfg):
 class GlobalRigidObjectCollection(RigidObjectCollection):
     """不会随并行环境重置的全局刚体集合。"""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 运行时运动状态属于动态障碍物资产本身。
+        self.motion_manager: GlobalObstacleManager | None = None
+
     def reset(self, env_ids=None, object_ids=None) -> None:
         """忽略场景重置。"""
         pass
+
+    def write_data_to_sim(self):
+        """在场景写入阶段推进运动学障碍物，再写入其外力数据。"""
+        if self.motion_manager is not None:
+            self.motion_manager.step(self.motion_manager.physics_dt)
+        super().write_data_to_sim()
 
 
 def make_global_obstacle_collection_cfg(

@@ -3,15 +3,19 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""自定义 PPO：Beta 动作分布、lidar CNN + dynamic MLP 特征提取、ValueNorm。"""
+"""自定义 PPO：CNN 时序编码、机体系 Beta 速度动作与 ValueNorm。"""
 
 from __future__ import annotations
+
+import math
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import ValueNorm, vec_to_world
+from .common import ValueNorm
+from .temporal_encoder import TemporalFeatureExtractor
 
 __all__ = [
     "PPO",
@@ -23,49 +27,10 @@ __all__ = [
 ]
 
 
-class PPOFeatureExtractor(nn.Module):
-    """lidar CNN + dynamic obstacle MLP + state 拼接融合。"""
+class PPOFeatureExtractor(TemporalFeatureExtractor):
+    """Actor 和 Critic 共享的 CNN + Transformer 时序编码器。"""
 
-    def __init__(self):
-        super().__init__()
-
-        self.lidar_encoder = nn.Sequential(
-            nn.LazyConv2d(out_channels=4, kernel_size=(5, 3), padding=(2, 1)),
-            nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=(5, 3), stride=(2, 1), padding=(2, 1)),
-            nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=(5, 3), stride=(2, 2), padding=(2, 1)),
-            nn.ELU(),
-            nn.Flatten(),
-            nn.LazyLinear(128),
-            nn.LayerNorm(128),
-        )
-
-        self.dynamic_encoder = nn.Sequential(
-            nn.Flatten(),
-            nn.LazyLinear(128),
-            nn.ELU(),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-        )
-
-        self.feature_fusion = nn.Sequential(
-            nn.LazyLinear(256),
-            nn.ELU(),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
-        )
-
-    def forward(self, obs):
-        state = obs["state"]
-        lidar = obs["lidar"]
-        dynamic_obstacle = obs["dynamic_obstacle"]
-
-        lidar_feature = self.lidar_encoder(lidar)
-        dynamic_feature = self.dynamic_encoder(dynamic_obstacle)
-
-        feature = torch.cat([lidar_feature, state, dynamic_feature], dim=-1)
-        return self.feature_fusion(feature)
+    pass
 
 
 class PPOActor(nn.Module):
@@ -131,17 +96,15 @@ def compute_gae(reward, done, value, next_value, gamma, lam):
 
 
 def make_minibatches(rollout, num_minibatches):
-    """把 rollout 打乱切成 minibatch。"""
-    rollout = rollout.reshape(-1)
-
-    batch_size = rollout.shape[0]
+    """随机打乱 transition 窗口索引，但不改变窗口内部的时间顺序。"""
+    batch_size = rollout.batch_size.numel()
     usable_size = batch_size // num_minibatches * num_minibatches
     minibatch_size = usable_size // num_minibatches
     indices = torch.randperm(usable_size, device=rollout.device)
 
     for start in range(0, usable_size, minibatch_size):
         batch_indices = indices[start : start + minibatch_size]
-        yield rollout[batch_indices]
+        yield batch_indices
 
 
 class PPO(nn.Module):
@@ -153,9 +116,18 @@ class PPO(nn.Module):
         self.cfg = cfg
         self.device = device
         self.action_dim = int(action_space)
-        self.action_limit = cfg.actor.action_limit
+        if self.action_dim != 3:
+            raise ValueError("Navigation PPO requires three body-frame velocity actions.")
+        self.action_limit = float(cfg.actor.action_limit)
+        if not math.isfinite(self.action_limit) or self.action_limit <= 0.0:
+            raise ValueError("actor.action_limit must be a finite, positive per-axis speed in m/s.")
 
-        self.feature_extractor = PPOFeatureExtractor().to(device)
+        feature_cfg = getattr(cfg, "feature_extractor", SimpleNamespace())
+        self.feature_extractor = PPOFeatureExtractor(
+            token_dim=getattr(feature_cfg, "token_dim", 128),
+            num_heads=getattr(feature_cfg, "num_heads", 4),
+            tau=getattr(feature_cfg, "time_decay_tau", 0.5),
+        ).to(device)
         self.actor = PPOActor(self.action_dim).to(device)
         self.critic = PPOCritic().to(device)
         self.value_norm = ValueNorm(1).to(device)
@@ -183,7 +155,7 @@ class PPO(nn.Module):
 
             action_normalized, log_prob = self.actor.sample(feature)
             state_value = self.critic(feature)
-            action = self._to_world_action(action_normalized, obs["direction"])
+            action = self._to_body_action(action_normalized)
 
             tensordict["agents", "action_normalized"] = action_normalized
             tensordict["agents", "action"] = action
@@ -198,7 +170,7 @@ class PPO(nn.Module):
         obs = tensordict["agents", "observation"]
         feature = self.feature_extractor(obs)
         action_normalized = self.actor.deterministic(feature)
-        action = self._to_world_action(action_normalized, obs["direction"])
+        action = self._to_body_action(action_normalized)
 
         tensordict["agents", "action_normalized"] = action_normalized
         tensordict["agents", "action"] = action
@@ -212,16 +184,17 @@ class PPO(nn.Module):
 
     def update(self, rollout):
         """用 rollout 更新网络，返回 loss 指标。"""
+        transitions = rollout["transitions"]
+        transition_flat = transitions.reshape(-1)
         with torch.no_grad():
-            next_obs = rollout["next", "agents", "observation"]
-            next_obs = self._flatten_observation(next_obs)
-            next_feature = self.feature_extractor(next_obs)
-            next_value = self.critic(next_feature).view_as(rollout["state_value"])
+            next_value = self._next_values_in_chunks(
+                rollout["history"], transition_flat, chunk_size=256
+            ).reshape_as(transitions["state_value"])
 
-        reward = rollout["next", "agents", "reward"]
+        reward = transitions["next", "agents", "reward"]
         # 成功、碰撞、越界和超时都会结束回合；用组合 done 防止跨回合自举。
-        done = rollout["next", "done"]
-        value = rollout["state_value"]
+        done = transitions["next", "done"]
+        value = transitions["state_value"]
         value = self.value_norm.denormalize(value)
         next_value = self.value_norm.denormalize(next_value)
 
@@ -237,21 +210,25 @@ class PPO(nn.Module):
         self.value_norm.update(returns)
         returns = self.value_norm.normalize(returns)
 
-        rollout["advantage"] = advantage
-        rollout["return"] = returns
+        transitions["advantage"] = advantage
+        transitions["return"] = returns
+        transition_flat = transitions.reshape(-1)
 
         infos = []
         for _ in range(self.cfg.training_epoch_num):
-            for minibatch in make_minibatches(rollout, self.cfg.num_minibatches):
-                infos.append(self._update_minibatch(minibatch))
+            for indices in make_minibatches(transitions, self.cfg.num_minibatches):
+                infos.append(self._update_minibatch(rollout, transition_flat, indices))
 
         return {
             key: torch.stack([info[key] for info in infos]).mean().item()
             for key in infos[0]
         }
 
-    def _update_minibatch(self, batch):
-        obs = batch["agents", "observation"]
+    def _update_minibatch(self, rollout, transition_flat, indices):
+        batch = transition_flat[indices]
+        obs = self._make_temporal_observation(
+            rollout["history"], transition_flat, indices, next=False
+        )
         action_normalized = batch["agents", "action_normalized"]
         old_log_prob = batch["sample_log_prob"]
         old_value = batch["state_value"].detach()
@@ -325,27 +302,84 @@ class PPO(nn.Module):
         self.critic.load_state_dict(checkpoint["critic"])
         self.value_norm.load_state_dict(checkpoint["value_norm"])
 
+    @torch.no_grad()
     def _initialize_lazy_modules(self, observation_space):
+        """按无 batch 维的观测形状初始化；向量也兼容整数维数 9、4。"""
+        shapes = {}
+        for key in ("state", "goal", "depth"):
+            shape = observation_space[key]
+            shapes[key] = (shape,) if isinstance(shape, int) else tuple(shape)
+        if shapes["state"] != (9,) or shapes["goal"] != (4,):
+            raise ValueError("Navigation PPO expects state shape (9,) and goal shape (4,).")
+        depth_shape = shapes["depth"]
+        if len(depth_shape) != 3 or depth_shape[0] != 1 or any(size <= 0 for size in depth_shape):
+            raise ValueError("Navigation PPO expects depth shape (1, H, W) with positive dimensions.")
+        history_length = int(getattr(getattr(self.cfg, "feature_extractor", None), "history_length", 6))
         obs = {
-            "state": torch.zeros(1, observation_space["state"], device=self.device),
-            "lidar": torch.zeros(1, *observation_space["lidar"], device=self.device),
-            "dynamic_obstacle": torch.zeros(
-                1,
-                *observation_space["dynamic_obstacle"],
-                device=self.device,
-            ),
+            "depth_history": torch.zeros(1, history_length, *shapes["depth"], device=self.device),
+            "state_history": torch.zeros(1, history_length, 9, device=self.device),
+            "action_history": torch.zeros(1, history_length, 3, device=self.device),
+            "age_seconds": torch.zeros(1, history_length, device=self.device),
+            "valid_mask": torch.ones(1, history_length, dtype=torch.bool, device=self.device),
+            "current_goal": torch.zeros(1, 4, device=self.device),
         }
         feature = self.feature_extractor(obs)
         self.actor(feature)
         self.critic(feature)
 
+    def _to_body_action(self, action_normalized):
+        """Beta 样本 (B, 3) 映射为机体系 [前、左、上] 速度，单位 m/s。
+
+        action_limit 是逐轴上限；完整姿态的世界系转换由环境 Action 完成。
+        log_prob 和 PPO 更新始终使用映射前的 action_normalized。
+        """
+        return (2.0 * action_normalized - 1.0) * self.action_limit
+
+    def _make_temporal_observation(self, history, transitions, indices, next):
+        """按 transition 索引从共享原始序列构造滑动历史窗口。"""
+        rollout_length = transitions.batch_size[0] // history["sequence_episode_id"].shape[0]
+        env_index = indices // rollout_length
+        time_index = indices % rollout_length
+        prefix_length = history["sequence_depth"].shape[1] - rollout_length
+        center = prefix_length - 1 + time_index + int(next)
+        history_length = int(getattr(self.cfg.feature_extractor, "history_length", 6))
+        history_stride = int(getattr(self.cfg.feature_extractor, "history_stride", 6))
+        offsets = torch.arange(history_length - 1, -1, -1, device=self.device) * history_stride
+        positions = center.unsqueeze(1) - offsets.unsqueeze(0)
+
+        sequence_episode_id = history["sequence_episode_id"]
+        current_episode_id = sequence_episode_id[env_index, center]
+        valid = history["sequence_valid"][env_index[:, None], positions]
+        valid &= sequence_episode_id[env_index[:, None], positions] == current_episode_id[:, None]
+
+        state = history["sequence_state"][env_index[:, None], positions]
+        depth = history["sequence_depth"][env_index[:, None], positions]
+        action = history["sequence_action"][env_index[:, None], positions]
+        goal = history["sequence_goal"][env_index, center]
+        age = offsets.to(torch.float32).unsqueeze(0).expand(indices.shape[0], -1) / 60.0
+        return {
+            "depth_history": depth,
+            "state_history": state,
+            "action_history": action,
+            "age_seconds": age,
+            "valid_mask": valid,
+            "current_goal": goal,
+        }
+
     def _flatten_observation(self, obs):
+        """合并 rollout 的 (N, T)，保留历史窗口维度。"""
         return {
             key: value.reshape(-1, *value.shape[2:])
             for key, value in obs.items()
         }
 
-    def _to_world_action(self, action_normalized, direction):
-        action = 2.0 * action_normalized * self.action_limit - self.action_limit
-        action = vec_to_world(action, direction)
-        return action.squeeze(1)
+    def _next_values_in_chunks(self, history, transitions, chunk_size=256):
+        """按索引分块构造 next 窗口，避免一次性 materialize 整个 rollout。"""
+        indices = torch.arange(transitions.batch_size[0], device=self.device)
+        features = []
+        for index_chunk in indices.split(chunk_size):
+            obs = self._make_temporal_observation(
+                history, transitions, index_chunk, next=True
+            )
+            features.append(self.critic(self.feature_extractor(obs)))
+        return torch.cat(features, dim=0)
