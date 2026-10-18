@@ -85,7 +85,7 @@ class NavCorridorEnvCfg(NavEnvCfg):
         ]
         self.events.initialize_dynamic_obstacles.func = initialize_corridor_obstacles
         self.events.reset_robot_state.params.update(
-            start_x_range=(-0.35, 0.35),
+            start_x_range=(0.0, 0.0),
             start_y=18.0,
             start_z_range=(1.0, 1.6),
         )
