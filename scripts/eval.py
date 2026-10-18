@@ -45,6 +45,7 @@ from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: 
 
 import nav.tasks  # noqa: F401, E402
 from nav.tasks.manager_based.nav.agents.common import navigation_observation_shapes, obs_to_tensordict  # noqa: E402
+from nav.tasks.manager_based.nav.agents.history_buffer import HistoryBuffer  # noqa: E402
 from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
 
 
@@ -121,6 +122,16 @@ def evaluate(env, agent, episodes_per_env, step_dt, stochastic=False):
 
     obs = env.reset()
     obs_td = obs_to_tensordict(obs, num_envs, device)
+    history_buffer = HistoryBuffer(
+        num_envs,
+        device,
+        history_length=agent.cfg.feature_extractor.history_length,
+        history_stride=agent.cfg.feature_extractor.history_stride,
+        action_limit=agent.action_limit,
+    )
+    history_buffer.append(obs_td["agents", "observation"])
+    for key, value in history_buffer.window().items():
+        obs_td["agents", "observation", key] = value
     max_episode_length = int(getattr(env.unwrapped, "max_episode_length", 0))
     if max_episode_length <= 0:
         episode_length_s = float(getattr(env.unwrapped.cfg, "episode_length_s", 60.0))
@@ -139,6 +150,16 @@ def evaluate(env, agent, episodes_per_env, step_dt, stochastic=False):
             next_obs, reward, terminated, truncated, _ = env.step(action_td["agents", "action"])
             reward = reward.reshape(-1).float()
             done = (terminated.reshape(-1).bool() | truncated.reshape(-1).bool())
+            next_obs_td = obs_to_tensordict(next_obs, num_envs, device)
+            history_buffer.reset(done)
+            previous_action = 2.0 * action_td["agents", "action_normalized"] - 1.0
+            previous_action[done] = 0.0
+            history_buffer.append(
+                next_obs_td["agents", "observation"],
+                previous_action=previous_action,
+            )
+            for key, value in history_buffer.window().items():
+                next_obs_td["agents", "observation", key] = value
             active = completed < episodes_per_env
             episode_returns[active] += reward[active]
             episode_lengths[active] += 1
@@ -163,7 +184,7 @@ def evaluate(env, agent, episodes_per_env, step_dt, stochastic=False):
             if torch.all(completed >= episodes_per_env):
                 break
 
-            obs_td = obs_to_tensordict(next_obs, num_envs, device)
+            obs_td = next_obs_td
         else:
             raise RuntimeError(
                 "Evaluation exceeded its step budget before every environment "

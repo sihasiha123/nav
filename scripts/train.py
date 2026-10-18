@@ -41,6 +41,7 @@ from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: 
 
 import nav.tasks  # noqa: F401, E402
 from nav.tasks.manager_based.nav.agents.common import navigation_observation_shapes, obs_to_tensordict  # noqa: E402
+from nav.tasks.manager_based.nav.agents.history_buffer import HistoryBuffer  # noqa: E402
 from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
 
 
@@ -182,8 +183,9 @@ class RolloutRewardComponentStatistics:
 
 
 def collect_algo_log_items(train_info, rollout):
+    transitions = rollout["transitions"]
     return {
-        "Rollout_Reward/step_mean": to_float(rollout["next", "agents", "reward"]),
+        "Rollout_Reward/step_mean": to_float(transitions["next", "agents", "reward"]),
         "Loss/actor": to_float(train_info["actor_loss"]),
         "Loss/critic": to_float(train_info["critic_loss"]),
         "Policy/entropy": to_float(train_info["entropy"]),
@@ -293,8 +295,26 @@ def make_agent(algo, cfg, env):
     raise ValueError(f"Unsupported algorithm: {algo}")
 
 
-def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
+def attach_history(obs_td, history):
+    for key, value in history.items():
+        obs_td["agents", "observation", key] = value
+    return obs_td
+
+
+def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer):
     frames = []
+    prefix = {
+        key: value.detach().clone()
+        for key, value in history_buffer.snapshot().items()
+    }
+    sequence_parts = {
+        "state": [prefix["state"]],
+        "goal": [prefix["goal"]],
+        "depth": [prefix["depth"]],
+        "action": [prefix["action"]],
+        "valid": [prefix["valid"]],
+        "episode_id": [prefix["episode_id"]],
+    }
     env_statistics = RolloutEnvStatistics(env.unwrapped)
     reward_component_statistics = RolloutRewardComponentStatistics(env.unwrapped)
 
@@ -315,15 +335,23 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
 
         # done 环境的 next_obs 已是新回合初始观测。当前 PPO 对包括超时在内的
         # done 均屏蔽 next_value，不使用该观测跨回合自举。
-        next_observation = next_obs_td["agents", "observation"].detach().clone()
-        current_observation = action_td["agents", "observation"].detach().clone()
         action_normalized = action_td["agents", "action_normalized"].detach().clone()
 
+        history_buffer.reset(done)
+        previous_action = 2.0 * action_normalized - 1.0
+        previous_action[done.reshape(-1)] = 0.0
+        history_buffer.append(
+            next_obs_td["agents", "observation"],
+            previous_action=previous_action,
+        )
+        next_snapshot = history_buffer.snapshot()
+        for key in sequence_parts:
+            sequence_parts[key].append(next_snapshot[key][:, -1:].detach().clone())
+        attach_history(next_obs_td, history_buffer.window())
         next_data = TensorDict(
             {
                 "agents": TensorDict(
                     {
-                        "observation": next_observation,
                         "reward": reward.detach().clone(),
                     },
                     batch_size=[env.unwrapped.num_envs],
@@ -341,7 +369,6 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
             {
                 "agents": TensorDict(
                     {
-                        "observation": current_observation,
                         "action_normalized": action_normalized,
                     },
                     batch_size=[env.unwrapped.num_envs],
@@ -358,8 +385,16 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
 
         obs_td = next_obs_td
 
-    # (N, T) batch；state/goal/depth 分别保留 (9,)/(4,)/(1,54,96)。
-    rollout = torch.stack(frames, dim=1)
+    transitions = torch.stack(frames, dim=1)
+    history = {
+        "sequence_state": torch.cat(sequence_parts["state"], dim=1),
+        "sequence_goal": torch.cat(sequence_parts["goal"], dim=1),
+        "sequence_depth": torch.cat(sequence_parts["depth"], dim=1),
+        "sequence_action": torch.cat(sequence_parts["action"], dim=1),
+        "sequence_valid": torch.cat(sequence_parts["valid"], dim=1),
+        "sequence_episode_id": torch.cat(sequence_parts["episode_id"], dim=1),
+    }
+    rollout = {"transitions": transitions, "history": history}
     env_log = env_statistics.metrics()
     env_log.update(reward_component_statistics.metrics())
     return rollout, obs_td, env_log
@@ -368,10 +403,21 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker):
 def train_ppo(env, agent, cfg, max_iterations, run_dir, save_interval, wandb_run):
     obs = env.reset()
     obs_td = obs_to_tensordict(obs, env.unwrapped.num_envs, env.unwrapped.device)
+    history_buffer = HistoryBuffer(
+        env.unwrapped.num_envs,
+        env.unwrapped.device,
+        history_length=cfg.feature_extractor.history_length,
+        history_stride=cfg.feature_extractor.history_stride,
+        action_limit=agent.action_limit,
+    )
+    history_buffer.append(obs_td["agents", "observation"])
+    attach_history(obs_td, history_buffer.window())
     return_tracker = EpisodeReturnTracker(env.unwrapped.num_envs, env.unwrapped.device)
 
     for iteration in range(max_iterations):
-        rollout, obs_td, env_log = collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker)
+        rollout, obs_td, env_log = collect_ppo_rollout(
+            env, agent, obs_td, cfg, return_tracker, history_buffer
+        )
         train_info = agent.update(rollout)
 
         algo_log = collect_algo_log_items(train_info, rollout)
@@ -381,6 +427,10 @@ def train_ppo(env, agent, cfg, max_iterations, run_dir, save_interval, wandb_run
         if env_log:
             wandb_run.log(env_log, step=iteration + 1)
         wandb_run.log(algo_log, step=iteration + 1)
+
+        # The rollout contains duplicated temporal image windows. Release it before
+        # collecting the next rollout so torch.stack does not overlap old and new data.
+        del rollout
 
         if save_interval > 0 and (iteration + 1) % save_interval == 0:
             checkpoint_path = run_dir / f"checkpoint_{iteration + 1}.pt"

@@ -1,6 +1,11 @@
 algo:
   feature_extractor:
     learning_rate: 0.0005
+    history_length: 6
+    history_stride: 6
+    token_dim: 128
+    num_heads: 4
+    time_decay_tau: 0.5
 
   actor:
     learning_rate: 0.0005
@@ -18,4 +23,4 @@ algo:
   max_grad_norm: 5.0
   training_frame_num: 32
   training_epoch_num: 4
-  num_minibatches: 16 # split into N minibatches
+  num_minibatches: 32 # 1024 env x 32 steps -> about 1024 transitions/minibatch
