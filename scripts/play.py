@@ -129,7 +129,8 @@ def main():
         episode_step = 0
         episode_index = 1
         print(f"[PLAY] task={args_cli.task} checkpoint={checkpoint}")
-        print("[PLAY] Close the Isaac Sim window to stop. Episodes reset automatically.")
+        print("[PLAY] Only a successful episode stops and keeps its trajectory.")
+        print("[PLAY] Collisions, out-of-bounds, and timeouts reset automatically.")
 
         with torch.inference_mode():
             while simulation_app.is_running():
@@ -160,17 +161,47 @@ def main():
                     next_obs_td["agents", "observation", key] = value
 
                 if bool(done[0].item()):
+                    reason = termination_reason(env.unwrapped)
                     print(
-                        f"[PLAY] episode={episode_index} reason={termination_reason(env.unwrapped)} "
+                        f"[PLAY] episode={episode_index} reason={reason} "
                         f"steps={episode_step} return={episode_return:.3f}"
                     )
+                    if reason == "success":
+                        if trail_points:
+                            trail_points.pop()
+                        draw.clear_lines()
+                        if len(trail_points) >= 2:
+                            draw.draw_lines(
+                                trail_points[:-1],
+                                trail_points[1:],
+                                [[0.1, 1.0, 0.2, 1.0]] * (len(trail_points) - 1),
+                                [args_cli.trail_thickness] * (len(trail_points) - 1),
+                            )
+                        print("[PLAY] Navigation succeeded. Keeping the trajectory on screen.")
+                        while simulation_app.is_running():
+                            simulation_app.update()
+                        break
+
+                    trail_points.clear()
+                    draw.clear_lines()
                     episode_index += 1
                     episode_return = 0.0
                     episode_step = 0
-                    trail_points.clear()
-                    draw.clear_lines()
+                    obs = env.reset()
+                    obs_td = obs_to_tensordict(obs, 1, env.unwrapped.device)
+                    history_buffer = HistoryBuffer(
+                        1,
+                        env.unwrapped.device,
+                        history_length=agent.cfg.feature_extractor.history_length,
+                        history_stride=agent.cfg.feature_extractor.history_stride,
+                        action_limit=agent.action_limit,
+                    )
+                    history_buffer.append(obs_td["agents", "observation"])
+                    for key, value in history_buffer.window().items():
+                        obs_td["agents", "observation", key] = value
 
-                obs_td = next_obs_td
+                if not bool(done[0].item()):
+                    obs_td = next_obs_td
     finally:
         env.close()
 
