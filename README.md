@@ -133,6 +133,16 @@ python scripts/eval.py \
 python scripts/eval.py --help
 ```
 
+使用 `play.py` 可视化演示单架无人机导航。窗口使用鸟瞰视角，绿色线条显示当前 episode 的飞行轨迹；任务结束后自动 reset，Isaac Sim 不会关闭：
+
+```bash
+/home/robot/IsaacLab/isaaclab.sh -p scripts/play.py \
+    --task Template-Nav-Corridor-v0 \
+    --checkpoint runs/ppo_20261016_020444/checkpoint_1500.pt \
+    --num_envs 1 \
+    --device cuda:0
+```
+
 ## VS Code 配置（可选）
 
 1. 按 `Ctrl+Shift+P` 打开命令面板。
