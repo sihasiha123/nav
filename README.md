@@ -117,7 +117,7 @@ python scripts/train.py \
 python scripts/eval.py --task Template-Nav-v0 --checkpoint <模型路径>
 ```
 
-走廊测试场景使用独立任务注册名。当前场景为 4.6 m x 40 m 窄走廊、两侧高墙、12 个沿飞行方向均匀错位分布的小型全高静态路障，不启用动态障碍物：
+走廊测试场景使用独立任务注册名。当前场景为 4.6 m x 40 m 窄走廊、两侧高墙、10 个小型全高静态路障和 10 个动态障碍物：
 
 ```bash
 python scripts/eval.py \
