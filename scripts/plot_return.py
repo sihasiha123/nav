@@ -31,10 +31,16 @@ def parse_args() -> argparse.Namespace:
         help="Run directory, for example runs/ppo_20260818_204907 or ppo_20260818_204907.",
     )
     parser.add_argument(
+        "--smooth",
+        choices=("ema", "moving"),
+        default="ema",
+        help="Curve smoothing method: exponential or trailing moving average (default: ema).",
+    )
+    parser.add_argument(
         "--window",
         type=int,
-        default=50,
-        help="Trailing moving-average window. Set to 1 to disable smoothing (default: 50).",
+        default=100,
+        help="Smoothing window. EMA uses alpha=2/(window+1) (default: 100).",
     )
     parser.add_argument(
         "--metric",
@@ -131,9 +137,29 @@ def moving_average(
         return iterations, values
 
     window = min(window, values.size)
-    cumulative = np.cumsum(np.insert(values, 0, 0.0))
-    averaged = (cumulative[window:] - cumulative[:-window]) / window
-    return iterations[window - 1 :], averaged
+    cumulative = np.cumsum(values)
+    counts = np.minimum(np.arange(1, values.size + 1), window)
+    averaged = np.empty_like(values)
+    averaged[:window] = cumulative[:window] / counts[:window]
+    if window < values.size:
+        averaged[window:] = (cumulative[window:] - cumulative[:-window]) / window
+    return iterations, averaged
+
+
+def exponential_moving_average(
+    iterations: np.ndarray,
+    values: np.ndarray,
+    window: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if window <= 1:
+        return iterations, values
+
+    alpha = 2.0 / (window + 1.0)
+    smoothed = np.empty_like(values)
+    smoothed[0] = values[0]
+    for index in range(1, values.size):
+        smoothed[index] = alpha * values[index] + (1.0 - alpha) * smoothed[index - 1]
+    return iterations, smoothed
 
 
 def plot_return(
@@ -141,30 +167,36 @@ def plot_return(
     iterations: np.ndarray,
     values: np.ndarray,
     metric: str,
+    smooth_method: str,
     window: int,
     output: Path,
 ) -> None:
-    smooth_iterations, smooth_values = moving_average(iterations, values, window)
+    smooth_iterations, smooth_values = (
+        exponential_moving_average(iterations, values, window)
+        if smooth_method == "ema"
+        else moving_average(iterations, values, window)
+    )
+    label = f"EMA ({window})" if smooth_method == "ema" else f"Moving average ({min(window, values.size)})"
 
     figure, axis = plt.subplots(figsize=(10.0, 5.5))
     axis.plot(iterations, values, color="#6b7280", alpha=0.28, linewidth=1.0, label="Raw")
     if window > 1:
-        effective_window = min(window, values.size)
         axis.plot(
             smooth_iterations,
             smooth_values,
             color="#1261a0",
             linewidth=2.2,
-            label=f"Moving average ({effective_window})",
+            label=label,
         )
 
     axis.axhline(0.0, color="#111827", linewidth=0.8, alpha=0.45)
-    axis.set_title(f"{run_dir.name}: Episode Return")
+    axis.set_title("Episode Return")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel(metric)
+    axis.set_ylabel("Return")
     axis.grid(True, color="#d1d5db", linewidth=0.7, alpha=0.65)
     axis.legend(frameon=False)
     axis.margins(x=0.01)
+    axis.set_xlim(left=0.0)
     figure.tight_layout()
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -174,7 +206,8 @@ def plot_return(
     print(f"[INFO] W&B points: {values.size} (iteration {iterations[0]} to {iterations[-1]})")
     print(f"[INFO] Last return: {values[-1]:.6f}")
     if window > 1:
-        print(f"[INFO] Last moving average: {smooth_values[-1]:.6f}")
+        method_name = "EMA" if smooth_method == "ema" else "moving average"
+        print(f"[INFO] Last {method_name}: {smooth_values[-1]:.6f}")
     print(f"[INFO] Plot saved: {output}")
 
 
@@ -192,7 +225,15 @@ def main() -> None:
         else PROJECT_ROOT / "figure" / f"{run_dir.name}_iteration_return.png"
     )
     output = output.resolve()
-    plot_return(run_dir, iterations, values, args.metric, args.window, output)
+    plot_return(
+        run_dir,
+        iterations,
+        values,
+        args.metric,
+        args.smooth,
+        args.window,
+        output,
+    )
 
 
 if __name__ == "__main__":

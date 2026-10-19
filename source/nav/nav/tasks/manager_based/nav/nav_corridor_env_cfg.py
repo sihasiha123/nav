@@ -24,7 +24,7 @@ class CorridorTerrainCfg(SubTerrainBaseCfg):
     obstacle_width_range: tuple[float, float] = (0.70, 0.90)
     obstacle_depth_range: tuple[float, float] = (0.45, 0.70)
     num_obstacles: int = 10
-    num_dynamic_obstacles: int = 10
+    num_dynamic_obstacles: int = 5
 
 
 def initialize_corridor_obstacles(env, env_ids=None):
