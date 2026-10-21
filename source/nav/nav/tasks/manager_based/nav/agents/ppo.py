@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .common import ValueNorm
-from .temporal_encoder import TemporalFeatureExtractor
+from .temporal_encoder import ConcatTemporalFeatureExtractor, TemporalFeatureExtractor
 
 __all__ = [
     "PPO",
@@ -123,11 +123,21 @@ class PPO(nn.Module):
             raise ValueError("actor.action_limit must be a finite, positive per-axis speed in m/s.")
 
         feature_cfg = getattr(cfg, "feature_extractor", SimpleNamespace())
-        self.feature_extractor = PPOFeatureExtractor(
-            token_dim=getattr(feature_cfg, "token_dim", 128),
-            num_heads=getattr(feature_cfg, "num_heads", 4),
-            tau=getattr(feature_cfg, "time_decay_tau", 0.5),
-        ).to(device)
+        feature_cfg = getattr(cfg, "feature_extractor", SimpleNamespace())
+        feature_type = getattr(feature_cfg, "type", "transformer")
+        if feature_type == "transformer":
+            self.feature_extractor = PPOFeatureExtractor(
+                token_dim=getattr(feature_cfg, "token_dim", 128),
+                num_heads=getattr(feature_cfg, "num_heads", 4),
+                tau=getattr(feature_cfg, "time_decay_tau", 0.5),
+            )
+        elif feature_type == "concat":
+            self.feature_extractor = ConcatTemporalFeatureExtractor(
+                token_dim=getattr(feature_cfg, "token_dim", 128),
+            )
+        else:
+            raise ValueError(f"Unsupported feature_extractor type: {feature_type}.")
+        self.feature_extractor = self.feature_extractor.to(device)
         self.actor = PPOActor(self.action_dim).to(device)
         self.critic = PPOCritic().to(device)
         self.value_norm = ValueNorm(1).to(device)

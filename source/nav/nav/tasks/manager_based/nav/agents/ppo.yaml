@@ -1,5 +1,6 @@
 algo:
   feature_extractor:
+    type: concat
     learning_rate: 0.0005
     history_length: 6
     history_stride: 6

@@ -1,4 +1,4 @@
-"""CNN 空间编码与历史 Transformer 融合。"""
+"""CNN 空间编码与历史时序融合。"""
 
 from __future__ import annotations
 
@@ -103,3 +103,50 @@ class TemporalFeatureExtractor(nn.Module):
         fused = self.norm1(query + attended)
         fused = self.norm2(fused + self.ffn(fused))
         return self.output(fused.squeeze(1))
+
+
+class ConcatTemporalFeatureExtractor(nn.Module):
+    """共享 CNN 逐帧编码后，将全局帧特征拼接并使用 MLP 融合。"""
+
+    def __init__(self, token_dim=128):
+        super().__init__()
+        self.token_dim = token_dim
+        self.depth_encoder = nn.Sequential(
+            ConvBlock(1, 16, 2),
+            ConvBlock(16, 32, 2),
+            ConvBlock(32, 64, 2),
+        )
+        self.visual_projection = nn.Linear(64, token_dim)
+        self.state_projection = nn.Sequential(
+            nn.Linear(12, token_dim), nn.ELU(), nn.Linear(token_dim, token_dim)
+        )
+        self.fusion = nn.Sequential(
+            nn.LazyLinear(256),
+            nn.ELU(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+        )
+
+    def encode_depth(self, depth):
+        batch, length = depth.shape[:2]
+        feature = self.depth_encoder(depth.reshape(batch * length, *depth.shape[2:]))
+        feature = feature.mean(dim=(2, 3))
+        return self.visual_projection(feature).reshape(batch, length, self.token_dim)
+
+    def forward(self, obs):
+        depth_history = obs["depth_history"]
+        state_history = obs["state_history"]
+        action_history = obs["action_history"]
+        valid = obs["valid_mask"].bool()
+        goal = obs["current_goal"]
+
+        visual = self.encode_depth(depth_history)
+        state = self.state_projection(
+            torch.cat((state_history, action_history), dim=-1)
+        )
+        visual = visual * valid.unsqueeze(-1)
+        state = state * valid.unsqueeze(-1)
+        fused_input = torch.cat(
+            (visual.flatten(1), state.flatten(1), goal), dim=-1
+        )
+        return self.fusion(fused_input)
