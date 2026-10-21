@@ -21,3 +21,13 @@ gym.register(
         "ppo_cfg_entry_point": f"{agents.__name__}:ppo.yaml",
     },
 )
+
+gym.register(
+    id="Template-Nav-Corridor-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.nav_corridor_env_cfg:NavCorridorEnvCfg",
+        "ppo_cfg_entry_point": f"{agents.__name__}:ppo.yaml",
+    },
+)
