@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +20,7 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--stochastic", action="store_true")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--trail_thickness", type=float, default=6.0)
+parser.add_argument("--output_dir", type=str, default=None)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -86,6 +90,33 @@ def main():
     if args_cli.trail_thickness <= 0.0:
         raise ValueError("--trail_thickness must be positive.")
 
+    output_dir = (
+        Path(args_cli.output_dir).expanduser()
+        if args_cli.output_dir
+        else Path(__file__).resolve().parents[1]
+        / "output"
+        / f"play_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    trajectory_path = output_dir / "trajectory.csv"
+    episodes_path = output_dir / "episodes.csv"
+    metadata_path = output_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "task": args_cli.task,
+                "checkpoint": str(checkpoint),
+                "seed": args_cli.seed,
+                "num_envs": 1,
+                "action_mode": "stochastic" if args_cli.stochastic else "deterministic_mean",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     env_cfg = parse_env_cfg(
         args_cli.task,
         device=args_cli.device,
@@ -113,6 +144,8 @@ def main():
             raise ValueError("Expected exactly one robot body for trajectory drawing.")
         body_id = body_ids[0]
         obs = env.reset()
+        position = robot.data.body_link_pos_w[0, body_id].detach().cpu().tolist()
+        trail_points = [tuple(float(value) for value in position)]
         obs_td = obs_to_tensordict(obs, 1, env.unwrapped.device)
         history_buffer = HistoryBuffer(
             1,
@@ -129,10 +162,24 @@ def main():
         episode_step = 0
         episode_index = 1
         print(f"[PLAY] task={args_cli.task} checkpoint={checkpoint}")
+        print(f"[PLAY] saving trajectories to {output_dir}")
         print("[PLAY] Only a successful episode stops and keeps its trajectory.")
         print("[PLAY] Collisions, out-of-bounds, and timeouts reset automatically.")
 
-        with torch.inference_mode():
+        with trajectory_path.open("w", newline="", encoding="utf-8") as trajectory_file, episodes_path.open(
+            "w", newline="", encoding="utf-8"
+        ) as episodes_file, torch.inference_mode():
+            trajectory_writer = csv.DictWriter(
+                trajectory_file,
+                fieldnames=("task", "seed", "episode", "step", "x", "y", "z", "episode_return", "outcome"),
+            )
+            episode_writer = csv.DictWriter(
+                episodes_file,
+                fieldnames=("task", "seed", "episode", "outcome", "return", "length_steps", "duration_seconds"),
+            )
+            trajectory_writer.writeheader()
+            episode_writer.writeheader()
+
             while simulation_app.is_running():
                 action_td = agent.act(obs_td) if args_cli.stochastic else agent.act_deterministic(obs_td)
                 next_obs, reward, terminated, truncated, _ = env.step(action_td["agents", "action"])
@@ -141,16 +188,17 @@ def main():
                 episode_return += float(reward[0].item())
                 episode_step += 1
 
-                position = robot.data.body_link_pos_w[0, body_id].detach().cpu().tolist()
-                trail_points.append(tuple(float(value) for value in position))
-                if len(trail_points) >= 2:
-                    draw.clear_lines()
-                    draw.draw_lines(
-                        trail_points[:-1],
-                        trail_points[1:],
-                        [[0.1, 1.0, 0.2, 1.0]] * (len(trail_points) - 1),
-                        [args_cli.trail_thickness] * (len(trail_points) - 1),
-                    )
+                if not bool(done[0].item()):
+                    position = robot.data.body_link_pos_w[0, body_id].detach().cpu().tolist()
+                    trail_points.append(tuple(float(value) for value in position))
+                    if len(trail_points) >= 2:
+                        draw.clear_lines()
+                        draw.draw_lines(
+                            trail_points[:-1],
+                            trail_points[1:],
+                            [[0.1, 1.0, 0.2, 1.0]] * (len(trail_points) - 1),
+                            [args_cli.trail_thickness] * (len(trail_points) - 1),
+                        )
 
                 next_obs_td = obs_to_tensordict(next_obs, 1, env.unwrapped.device)
                 history_buffer.reset(done)
@@ -162,13 +210,39 @@ def main():
 
                 if bool(done[0].item()):
                     reason = termination_reason(env.unwrapped)
+                    duration = float(episode_step * env.unwrapped.step_dt)
+                    for step, (x, y, z) in enumerate(trail_points):
+                        trajectory_writer.writerow(
+                            {
+                                "task": args_cli.task,
+                                "seed": args_cli.seed,
+                                "episode": episode_index,
+                                "step": step,
+                                "x": x,
+                                "y": y,
+                                "z": z,
+                                "episode_return": episode_return,
+                                "outcome": reason,
+                            }
+                        )
+                    episode_writer.writerow(
+                        {
+                            "task": args_cli.task,
+                            "seed": args_cli.seed,
+                            "episode": episode_index,
+                            "outcome": reason,
+                            "return": episode_return,
+                            "length_steps": episode_step,
+                            "duration_seconds": duration,
+                        }
+                    )
+                    trajectory_file.flush()
+                    episodes_file.flush()
                     print(
                         f"[PLAY] episode={episode_index} reason={reason} "
-                        f"steps={episode_step} return={episode_return:.3f}"
+                        f"steps={episode_step} return={episode_return:.3f} duration={duration:.2f}s"
                     )
                     if reason == "success":
-                        if trail_points:
-                            trail_points.pop()
                         draw.clear_lines()
                         if len(trail_points) >= 2:
                             draw.draw_lines(
@@ -177,6 +251,8 @@ def main():
                                 [[0.1, 1.0, 0.2, 1.0]] * (len(trail_points) - 1),
                                 [args_cli.trail_thickness] * (len(trail_points) - 1),
                             )
+                        print(f"[PLAY] trajectory saved: {trajectory_path}")
+                        print(f"[PLAY] episode summary saved: {episodes_path}")
                         print("[PLAY] Navigation succeeded. Keeping the trajectory on screen.")
                         while simulation_app.is_running():
                             simulation_app.update()
@@ -199,6 +275,8 @@ def main():
                     history_buffer.append(obs_td["agents", "observation"])
                     for key, value in history_buffer.window().items():
                         obs_td["agents", "observation", key] = value
+                    position = robot.data.body_link_pos_w[0, body_id].detach().cpu().tolist()
+                    trail_points = [tuple(float(value) for value in position)]
 
                 if not bool(done[0].item()):
                     obs_td = next_obs_td
