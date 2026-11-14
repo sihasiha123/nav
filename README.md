@@ -8,6 +8,7 @@
 
 ```text
 Template-Nav-v0
+Template-Nav-Corridor-v0
 ```
 
 主要目录：
@@ -189,6 +190,26 @@ python scripts/play.py \
 安装 Matplotlib 时还会生成 `trajectory.png`。图片为 XY 轨迹，无障碍物背景；仿真窗口显示实际场景。
 Play 在终止时延迟自动重置，完整记录终点和最后一段路程，下一次尝试才显式 reset。
 固定回合模式 `--episodes N` 保存每回合轨迹，后续文件使用 `_002` 等后缀。
+
+### 走廊场景 Play
+
+走廊场景移植自 `dev_zl`：40 米长、4 米净宽（含两侧墙共 4.6 米宽），
+10 个静态障碍物和 5 个横向移动的动态障碍物，起点 Y=18 米，目标 Y=-18 米。
+使用同一个检查点，只更换任务和输出目录，无需重新训练：
+
+```bash
+python scripts/play.py \
+    --task Template-Nav-Corridor-v0 \
+    --checkpoint runs/lstm_ppo_20261114_151819/checkpoint_400.pt \
+    --num_envs 1 --until_success --hold --seed 0 \
+    --output_dir output/play_lstm_400_corridor_success
+```
+
+失败自动重试、成功后暂停截图，仍输出 `attempts.csv`、`summary.json` 和成功轨迹文件。
+统计口径与原始训练场景一致，`summary.json` 中的 `task` 为 `Template-Nav-Corridor-v0`。
+两种场景分别读取各自的首次成功回合、三维路径长度和仿真用时，原始场景继续用 `Template-Nav-v0`。
+
+无需启动仿真器的走廊几何检查：`python scripts/test_corridor_terrain.py`。
 
 ## VS Code 配置（可选）
 
