@@ -1,4 +1,5 @@
 algo:
+  policy_type: ppo
   feature_extractor:
     learning_rate: 0.0005
     history_length: 6

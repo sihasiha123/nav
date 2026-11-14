@@ -16,11 +16,11 @@ from types import SimpleNamespace
 
 from isaaclab.app import AppLauncher
 
-
 parser = argparse.ArgumentParser(description="Evaluate a UAV navigation PPO checkpoint.")
 parser.add_argument("--checkpoint", type=str, required=True)
 parser.add_argument("--task", type=str, default="Template-Nav-v0")
-parser.add_argument("--agent", type=str, default="ppo_cfg_entry_point")
+parser.add_argument("--algo", choices=("ppo", "lstm_ppo"), default=None, help="Defaults to checkpoint policy type.")
+parser.add_argument("--agent", type=str, default=None, help="Override saved agent config with a registry key.")
 parser.add_argument("--num_envs", type=int, default=None)
 parser.add_argument("--episodes_per_env", type=int, default=1)
 parser.add_argument("--seed", type=int, default=0)
@@ -39,14 +39,13 @@ simulation_app = app_launcher.app
 
 
 import gymnasium as gym  # noqa: E402
+import nav.tasks  # noqa: F401, E402
 import torch  # noqa: E402
+from nav.tasks.manager_based.nav.agents.common import navigation_observation_shapes, obs_to_tensordict  # noqa: E402
+from nav.tasks.manager_based.nav.agents.factory import make_policy  # noqa: E402
+from nav.tasks.manager_based.nav.agents.history_buffer import HistoryBuffer  # noqa: E402
 
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: E402
-
-import nav.tasks  # noqa: F401, E402
-from nav.tasks.manager_based.nav.agents.common import navigation_observation_shapes, obs_to_tensordict  # noqa: E402
-from nav.tasks.manager_based.nav.agents.history_buffer import HistoryBuffer  # noqa: E402
-from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
 
 
 def to_namespace(value):
@@ -62,9 +61,10 @@ def load_agent_cfg(task_name, entry_point_key):
     return to_namespace(cfg)
 
 
-def make_agent(cfg, env):
+def make_agent(cfg, env, algo="ppo"):
     observation_space = navigation_observation_shapes(env)
-    return PPO(
+    return make_policy(
+        algo=algo,
         cfg=cfg,
         observation_space=observation_space,
         action_space=env.action_space.shape[-1],
@@ -122,6 +122,8 @@ def evaluate(env, agent, episodes_per_env, step_dt, stochastic=False):
 
     obs = env.reset()
     obs_td = obs_to_tensordict(obs, num_envs, device)
+    if agent.is_recurrent:
+        agent.reset_memory()
     history_buffer = HistoryBuffer(
         num_envs,
         device,
@@ -150,6 +152,8 @@ def evaluate(env, agent, episodes_per_env, step_dt, stochastic=False):
             next_obs, reward, terminated, truncated, _ = env.step(action_td["agents", "action"])
             reward = reward.reshape(-1).float()
             done = (terminated.reshape(-1).bool() | truncated.reshape(-1).bool())
+            if agent.is_recurrent:
+                agent.reset_memory(done)
             next_obs_td = obs_to_tensordict(next_obs, num_envs, device)
             history_buffer.reset(done)
             previous_action = 2.0 * action_td["agents", "action_normalized"] - 1.0
@@ -445,16 +449,25 @@ def main():
     env_cfg.seed = args_cli.seed
     torch.manual_seed(args_cli.seed)
 
-    agent_cfg = load_agent_cfg(args_cli.task, args_cli.agent)
+    checkpoint_data = torch.load(checkpoint, map_location="cpu")
+    checkpoint_algo = checkpoint_data.get("policy_type", "ppo")
+    algo = args_cli.algo or checkpoint_algo
+    if algo != checkpoint_algo:
+        raise ValueError(f"Requested {algo!r}, but checkpoint contains {checkpoint_algo!r}.")
+    if args_cli.agent is None and "agent_config" in checkpoint_data:
+        agent_cfg = to_namespace(checkpoint_data["agent_config"])
+    else:
+        agent_cfg = load_agent_cfg(args_cli.task, args_cli.agent or f"{algo}_cfg_entry_point")
+    del checkpoint_data
     env = gym.make(args_cli.task, cfg=env_cfg)
     try:
-        agent = make_agent(agent_cfg, env)
+        agent = make_agent(agent_cfg, env, algo)
         try:
             agent.load(checkpoint)
         except (RuntimeError, KeyError) as exc:
             raise RuntimeError(
-                "Checkpoint could not be loaded into the state/goal/depth PPO network. "
-                "Old LiDAR checkpoints are incompatible; use a checkpoint trained with the new network. "
+                f"Checkpoint could not be loaded into the {algo} network. "
+                "Use a checkpoint trained with the matching architecture and configuration. "
                 f"Original error: {exc}"
             ) from exc
         step_dt = float(getattr(env.unwrapped, "step_dt", env_cfg.sim.dt * env_cfg.decimation))
@@ -476,6 +489,8 @@ def main():
             step_dt,
             args_cli.stochastic,
         )
+        summary["algorithm"] = algo
+        summary["parameter_count"] = sum(parameter.numel() for parameter in agent.parameters())
         write_results(output_dir, records, summary)
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         print(f"[EVAL] results saved to {output_dir}")

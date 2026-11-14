@@ -110,6 +110,9 @@ def make_minibatches(rollout, num_minibatches):
 class PPO(nn.Module):
     """PPO 算法：act 采样、update 用 GAE + clip 更新。"""
 
+    policy_type = "ppo"
+    is_recurrent = False
+
     def __init__(self, cfg, observation_space, action_space, device):
         super().__init__()
 
@@ -123,11 +126,7 @@ class PPO(nn.Module):
             raise ValueError("actor.action_limit must be a finite, positive per-axis speed in m/s.")
 
         feature_cfg = getattr(cfg, "feature_extractor", SimpleNamespace())
-        self.feature_extractor = PPOFeatureExtractor(
-            token_dim=getattr(feature_cfg, "token_dim", 128),
-            num_heads=getattr(feature_cfg, "num_heads", 4),
-            tau=getattr(feature_cfg, "time_decay_tau", 0.5),
-        ).to(device)
+        self.feature_extractor = self._make_feature_extractor(feature_cfg).to(device)
         self.actor = PPOActor(self.action_dim).to(device)
         self.critic = PPOCritic().to(device)
         self.value_norm = ValueNorm(1).to(device)
@@ -145,6 +144,13 @@ class PPO(nn.Module):
         self.critic_optimizer = torch.optim.Adam(
             self.critic.parameters(),
             lr=cfg.critic.learning_rate,
+        )
+
+    def _make_feature_extractor(self, feature_cfg):
+        return PPOFeatureExtractor(
+            token_dim=getattr(feature_cfg, "token_dim", 128),
+            num_heads=getattr(feature_cfg, "num_heads", 4),
+            tau=getattr(feature_cfg, "time_decay_tau", 0.5),
         )
 
     def act(self, tensordict):
@@ -191,6 +197,20 @@ class PPO(nn.Module):
                 rollout["history"], transition_flat, chunk_size=256
             ).reshape_as(transitions["state_value"])
 
+        self._prepare_returns(transitions, next_value)
+        transition_flat = transitions.reshape(-1)
+
+        infos = []
+        for _ in range(self.cfg.training_epoch_num):
+            for indices in make_minibatches(transitions, self.cfg.num_minibatches):
+                infos.append(self._update_minibatch(rollout, transition_flat, indices))
+
+        return {
+            key: torch.stack([info[key] for info in infos]).mean().item()
+            for key in infos[0]
+        }
+
+    def _prepare_returns(self, transitions, next_value):
         reward = transitions["next", "agents", "reward"]
         # 成功、碰撞、越界和超时都会结束回合；用组合 done 防止跨回合自举。
         done = transitions["next", "done"]
@@ -212,30 +232,28 @@ class PPO(nn.Module):
 
         transitions["advantage"] = advantage
         transitions["return"] = returns
-        transition_flat = transitions.reshape(-1)
-
-        infos = []
-        for _ in range(self.cfg.training_epoch_num):
-            for indices in make_minibatches(transitions, self.cfg.num_minibatches):
-                infos.append(self._update_minibatch(rollout, transition_flat, indices))
-
-        return {
-            key: torch.stack([info[key] for info in infos]).mean().item()
-            for key in infos[0]
-        }
 
     def _update_minibatch(self, rollout, transition_flat, indices):
         batch = transition_flat[indices]
         obs = self._make_temporal_observation(
             rollout["history"], transition_flat, indices, next=False
         )
+        feature = self.feature_extractor(obs)
+        return self._update_features(batch, feature)
+
+    def _update_features(self, batch, feature, valid_mask=None):
+        """Identical PPO objective/optimizers for attention and recurrent features."""
+        if valid_mask is not None:
+            batch = batch[valid_mask]
+            feature = feature[valid_mask]
         action_normalized = batch["agents", "action_normalized"]
         old_log_prob = batch["sample_log_prob"]
         old_value = batch["state_value"].detach()
         advantage = batch["advantage"]
         returns = batch["return"]
 
-        new_log_prob, entropy, value = self.evaluate_action(obs, action_normalized)
+        new_log_prob, entropy = self.actor.evaluate_action(feature, action_normalized)
+        value = self.critic(feature)
         ratio = torch.exp(new_log_prob - old_log_prob).unsqueeze(-1)
 
         actor_loss_1 = ratio * advantage
@@ -285,8 +303,17 @@ class PPO(nn.Module):
         }
 
     def save(self, path):
+        def as_dict(value):
+            if isinstance(value, SimpleNamespace):
+                return {key: as_dict(item) for key, item in vars(value).items()}
+            if isinstance(value, dict):
+                return {key: as_dict(item) for key, item in value.items()}
+            return value
+
         torch.save(
             {
+                "policy_type": self.policy_type,
+                "agent_config": as_dict(self.cfg),
                 "feature_extractor": self.feature_extractor.state_dict(),
                 "actor": self.actor.state_dict(),
                 "critic": self.critic.state_dict(),
@@ -297,10 +324,15 @@ class PPO(nn.Module):
 
     def load(self, path):
         checkpoint = torch.load(path, map_location=self.device)
+        policy_type = checkpoint.get("policy_type", "ppo")
+        if policy_type != self.policy_type:
+            raise ValueError(f"Checkpoint policy {policy_type!r} does not match {self.policy_type!r}.")
         self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
         self.actor.load_state_dict(checkpoint["actor"])
         self.critic.load_state_dict(checkpoint["critic"])
         self.value_norm.load_state_dict(checkpoint["value_norm"])
+        if self.is_recurrent:
+            self.reset_memory()
 
     @torch.no_grad()
     def _initialize_lazy_modules(self, observation_space):
@@ -314,6 +346,11 @@ class PPO(nn.Module):
         depth_shape = shapes["depth"]
         if len(depth_shape) != 3 or depth_shape[0] != 1 or any(size <= 0 for size in depth_shape):
             raise ValueError("Navigation PPO expects depth shape (1, H, W) with positive dimensions.")
+        feature = self._initial_feature(shapes)
+        self.actor(feature)
+        self.critic(feature)
+
+    def _initial_feature(self, shapes):
         history_length = int(getattr(getattr(self.cfg, "feature_extractor", None), "history_length", 6))
         obs = {
             "depth_history": torch.zeros(1, history_length, *shapes["depth"], device=self.device),
@@ -323,9 +360,7 @@ class PPO(nn.Module):
             "valid_mask": torch.ones(1, history_length, dtype=torch.bool, device=self.device),
             "current_goal": torch.zeros(1, 4, device=self.device),
         }
-        feature = self.feature_extractor(obs)
-        self.actor(feature)
-        self.critic(feature)
+        return self.feature_extractor(obs)
 
     def _to_body_action(self, action_normalized):
         """Beta 样本 (B, 3) 映射为机体系 [前、左、上] 速度，单位 m/s。

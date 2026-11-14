@@ -9,16 +9,18 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from isaaclab.app import AppLauncher
 
-
 parser = argparse.ArgumentParser(description="Train UAV navigation agents.")
 parser.add_argument("--task", type=str, default="Template-Nav-v0")
-parser.add_argument("--algo", type=str, default="ppo")
-parser.add_argument("--agent", type=str, default="ppo_cfg_entry_point")
+parser.add_argument("--algo", choices=("ppo", "lstm_ppo"), default="ppo")
+parser.add_argument(
+    "--agent", type=str, default=None, help="Agent config registry key; defaults to <algo>_cfg_entry_point."
+)
 parser.add_argument("--num_envs", type=int, default=None)
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--max_iterations", type=int, default=1000)
@@ -33,17 +35,15 @@ simulation_app = app_launcher.app
 
 
 import gymnasium as gym  # noqa: E402
+import nav.tasks  # noqa: F401, E402
 import torch  # noqa: E402
 import wandb  # noqa: E402
+from nav.tasks.manager_based.nav.agents.common import navigation_observation_shapes, obs_to_tensordict  # noqa: E402
+from nav.tasks.manager_based.nav.agents.factory import make_policy  # noqa: E402
+from nav.tasks.manager_based.nav.agents.history_buffer import HistoryBuffer  # noqa: E402
 from tensordict import TensorDict  # noqa: E402
 
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: E402
-
-import nav.tasks  # noqa: F401, E402
-from nav.tasks.manager_based.nav.agents.common import navigation_observation_shapes, obs_to_tensordict  # noqa: E402
-from nav.tasks.manager_based.nav.agents.history_buffer import HistoryBuffer  # noqa: E402
-from nav.tasks.manager_based.nav.agents.ppo import PPO  # noqa: E402
-
 
 WANDB_PROJECT = "nav-drone-rl"
 
@@ -283,16 +283,9 @@ def init_wandb(run_dir, env_cfg):
 
 
 def make_agent(algo, cfg, env):
-    if algo == "ppo":
-        observation_space = navigation_observation_shapes(env)
-        return PPO(
-            cfg=cfg,
-            observation_space=observation_space,
-            action_space=env.action_space.shape[-1],
-            device=env.unwrapped.device,
-        )
-
-    raise ValueError(f"Unsupported algorithm: {algo}")
+    return make_policy(
+        algo, cfg, navigation_observation_shapes(env), env.action_space.shape[-1], env.unwrapped.device
+    )
 
 
 def attach_history(obs_td, history):
@@ -329,6 +322,8 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
         terminated = terminated.reshape(env.unwrapped.num_envs, 1).bool()
         truncated = truncated.reshape(env.unwrapped.num_envs, 1).bool()
         done = terminated | truncated
+        if agent.is_recurrent:
+            agent.reset_memory(done)
         completed_returns = return_tracker.update(reward, done)
         env_statistics.update(done, completed_returns)
         reward_component_statistics.update()
@@ -381,6 +376,9 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
             batch_size=[env.unwrapped.num_envs],
             device=env.unwrapped.device,
         )
+        if agent.is_recurrent:
+            for key in ("recurrent_h", "recurrent_c", "episode_start"):
+                transition[key] = action_td[key].detach().clone()
         frames.append(transition)
 
         obs_td = next_obs_td
@@ -395,6 +393,8 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
         "sequence_episode_id": torch.cat(sequence_parts["episode_id"], dim=1),
     }
     rollout = {"transitions": transitions, "history": history}
+    if agent.is_recurrent:
+        rollout["bootstrap_value"] = agent.bootstrap_value(obs_td).detach().clone()
     env_log = env_statistics.metrics()
     env_log.update(reward_component_statistics.metrics())
     return rollout, obs_td, env_log
@@ -403,6 +403,8 @@ def collect_ppo_rollout(env, agent, obs_td, cfg, return_tracker, history_buffer)
 def train_ppo(env, agent, cfg, max_iterations, run_dir, save_interval, wandb_run):
     obs = env.reset()
     obs_td = obs_to_tensordict(obs, env.unwrapped.num_envs, env.unwrapped.device)
+    if agent.is_recurrent:
+        agent.reset_memory()
     history_buffer = HistoryBuffer(
         env.unwrapped.num_envs,
         env.unwrapped.device,
@@ -419,8 +421,8 @@ def train_ppo(env, agent, cfg, max_iterations, run_dir, save_interval, wandb_run
             env, agent, obs_td, cfg, return_tracker, history_buffer
         )
         train_info = agent.update(rollout)
-
         algo_log = collect_algo_log_items(train_info, rollout)
+        algo_log["Training/environment_steps"] = (iteration + 1) * env.unwrapped.num_envs * cfg.training_frame_num
         terminal_log = collect_terminal_log_items(env_log, algo_log)
         print(format_log(iteration, terminal_log, title="TRAIN"))
 
@@ -428,8 +430,7 @@ def train_ppo(env, agent, cfg, max_iterations, run_dir, save_interval, wandb_run
             wandb_run.log(env_log, step=iteration + 1)
         wandb_run.log(algo_log, step=iteration + 1)
 
-        # The rollout contains duplicated temporal image windows. Release it before
-        # collecting the next rollout so torch.stack does not overlap old and new data.
+        # Release the raw image sequence before collecting the next rollout.
         del rollout
 
         if save_interval > 0 and (iteration + 1) % save_interval == 0:
@@ -454,7 +455,9 @@ def main():
     if args_cli.seed is not None:
         env_cfg.seed = args_cli.seed
 
-    agent_cfg = load_agent_cfg(args_cli.task, args_cli.agent)
+    if env_cfg.seed is not None:
+        torch.manual_seed(env_cfg.seed)
+    agent_cfg = load_agent_cfg(args_cli.task, args_cli.agent or f"{args_cli.algo}_cfg_entry_point")
     # 日志目录固定在 nav 项目根目录（scripts/..）下，避免写到 IsaacLab 启动目录
     log_root_path = Path(__file__).resolve().parents[1] / args_cli.log_dir
     run_dir = make_run_dir(str(log_root_path), args_cli.algo)
@@ -462,8 +465,30 @@ def main():
     env = gym.make(args_cli.task, cfg=env_cfg)
     agent = make_agent(args_cli.algo, agent_cfg, env)
     wandb_run = init_wandb(run_dir, env_cfg)
+    parameters = {
+        name: sum(parameter.numel() for parameter in module.parameters())
+        for name, module in (
+            ("feature_extractor", agent.feature_extractor),
+            ("actor", agent.actor),
+            ("critic", agent.critic),
+        )
+    }
+    parameters["total"] = sum(parameters.values())
+    metadata = {
+        "algorithm": args_cli.algo,
+        "seed": env_cfg.seed,
+        "num_envs": env.unwrapped.num_envs,
+        "step_dt": float(env.unwrapped.step_dt),
+        "max_iterations": args_cli.max_iterations,
+        "planned_environment_steps": args_cli.max_iterations * env.unwrapped.num_envs * agent_cfg.training_frame_num,
+        "parameters": parameters,
+        "agent_config": json.loads(json.dumps(agent_cfg, default=vars)),
+    }
+    (run_dir / "training_config.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    wandb_run.config.update(metadata)
+    print(f"[INFO] algorithm={args_cli.algo}, parameters={parameters['total']}, seed={env_cfg.seed}")
 
-    if args_cli.algo == "ppo":
+    if args_cli.algo in ("ppo", "lstm_ppo"):
         train_ppo(
             env,
             agent,

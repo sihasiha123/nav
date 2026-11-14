@@ -1,0 +1,31 @@
+algo:
+  policy_type: lstm_ppo
+  feature_extractor:
+    learning_rate: 0.0005
+    # One current frame per decision; history lives in the LSTM, not a frame window.
+    history_length: 1
+    history_stride: 1
+    token_dim: 128
+    hidden_dim: 128
+    num_layers: 1
+
+  recurrent:
+    sequence_length: 32 # truncated BPTT; online memory persists across rollouts
+
+  actor:
+    learning_rate: 0.0005
+    clip_ratio: 0.1
+    action_limit: 2.0 # m/s, same body-frame mapping and Beta head as RTA-PPO
+
+  critic:
+    learning_rate: 0.0005
+    clip_ratio: 0.1
+    value_loss_coefficient: 1.0
+
+  entropy_loss_coefficient: 0.001
+  gamma: 0.99
+  gae_lambda: 0.95
+  max_grad_norm: 5.0
+  training_frame_num: 32
+  training_epoch_num: 4
+  num_minibatches: 32 # shuffle sequence fragments, never individual time steps

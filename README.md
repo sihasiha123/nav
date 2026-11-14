@@ -109,6 +109,47 @@ python scripts/train.py \
 
 训练结果默认保存在项目根目录的 `runs/` 中。Weights & Biases 当前使用离线模式，训练完成后可执行日志中给出的 `wandb sync` 命令上传数据。
 
+### 持续记忆 LSTM-PPO 对比基线
+
+原 RTA-PPO 继续使用 `--algo ppo`。新增的 `--algo lstm_ppo` 自动选择
+`lstm_ppo_cfg_entry_point` 配置：每个决策步只编码当前深度图的 6 个区域、状态和先前动作，
+将特征输入单层 128 维 LSTM，再与包含当前目标的 query 融合。输出仍为共享的 256 维特征、
+Beta 动作分布和三维机体系速度指令；环境、奖励、控制器及终止分类共用原实现。
+
+```bash
+python scripts/train.py --task Template-Nav-v0 --algo lstm_ppo \
+    --num_envs 1024 --seed 0 --max_iterations 2000 --headless
+```
+
+每个环境独立保留 `h,c`，跨 rollout 延续，回合结束时仅清空对应环境的记忆和先前动作。
+训练将 rollout 切成连续序列，默认 `training_frame_num=32`、`recurrent.sequence_length=32`，
+只打乱序列片段，使用采样时保存的片段起始记忆；片段内部按回合起点重置记忆，
+不足长度的尾片段用 mask 排除填充位置的损失。梯度在片段边界截断，在线记忆不会因截断清零。
+成功、碰撞、越界和超时均沿用原 PPO 的 done 自举屏蔽规则。
+
+检查点保存策略类型和网络配置；评估默认自动识别，使用 Beta 均值动作：
+
+```bash
+python scripts/eval.py --task Template-Nav-v0 \
+    --checkpoint runs/lstm_ppo_<时间戳>/checkpoint_final.pt \
+    --num_envs 1024 --episodes_per_env 1 --seed 0 --headless
+```
+
+可以用 `--agent <配置注册键>` 显式覆盖配置，策略类型必须匹配。旧版未保存类型的
+PPO 检查点按 `ppo` 处理；RTA-PPO 检查点不能作为 LSTM-PPO 权重加载，LSTM 需要从头训练。
+训练目录中的 `training_config.json` 和 W&B 会记录配置、种子、模型参数量及环境步数，
+评估 `summary.json` 也记录算法和参数量。
+
+比较时应保持相同环境、训练步数和评估设置，并分别运行多个训练种子。持续 LSTM 的记忆范围
+与 RTA-PPO 的 6 帧、间隔 6 步窗口不同，因此这是完整策略基线，不能单独证明某个区域注意力组件的效果。
+1,024 个测试回合也不等于 1,024 次独立训练。此处仅提供实现和运行方式，不包含已训练结果。
+
+无需启动仿真器的 CPU 回归检查（使用已安装 PyTorch 和 TensorDict 的解释器）：
+
+```bash
+python scripts/test_recurrent_ppo.py
+```
+
 ## 评估
 
 使用训练生成的模型进行评估：

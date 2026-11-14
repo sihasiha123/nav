@@ -19,5 +19,6 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.nav_env_cfg:NavEnvCfg",
         "ppo_cfg_entry_point": f"{agents.__name__}:ppo.yaml",
+        "lstm_ppo_cfg_entry_point": f"{agents.__name__}:lstm_ppo.yaml",
     },
 )
