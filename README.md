@@ -164,6 +164,32 @@ python scripts/eval.py --task Template-Nav-v0 --checkpoint <模型路径>
 python scripts/eval.py --help
 ```
 
+## Play 与轨迹导出
+
+在原训练环境中失败自动重试，直到第一次成功后暂停，保留成功现场供截图。
+自动识别检查点中的 PPO / LSTM-PPO 类型和配置：
+
+```bash
+python scripts/play.py \
+    --task Template-Nav-v0 \
+    --checkpoint runs/lstm_ppo_20261114_151819/checkpoint_400.pt \
+    --num_envs 1 --until_success --hold --seed 0 \
+    --output_dir output/play_lstm_400
+```
+
+默认使用 Beta 均值动作，LSTM 在回合开始和结束时重置记忆；碰撞、越界或超时后重新开始，
+不重新设置随机种子。默认不限尝试次数，`--max_attempts N` 可限制次数；`--episodes N` 可改为固定回合数。
+成功后暂停物理仿真，保留机器人终点和绿色轨迹，可移动相机截图；关闭窗口或 Ctrl+C 退出。
+`--no-hold` 可成功后直接退出，`--headless` 可只导出文件，`--stochastic` 可改为采样动作。
+
+`attempts.csv` 每回合立即追加结果和指标，`summary.json` 记录尝试次数（含成功回合）、失败次数、
+成功所在回合、成功三维路径长度（米）、XY 路径长度、成功仿真用时及实际运行用时。
+仿真用时为控制步数乘以 `step_dt`，实际用时单独记录；总实际用时不含截图等待时间。
+默认成功轨迹输出为 `trajectory.csv`（时间和世界坐标）、`trajectory.json`、`trajectory.svg`，
+安装 Matplotlib 时还会生成 `trajectory.png`。图片为 XY 轨迹，无障碍物背景；仿真窗口显示实际场景。
+Play 在终止时延迟自动重置，完整记录终点和最后一段路程，下一次尝试才显式 reset。
+固定回合模式 `--episodes N` 保存每回合轨迹，后续文件使用 `_002` 等后缀。
+
 ## VS Code 配置（可选）
 
 1. 按 `Ctrl+Shift+P` 打开命令面板。
